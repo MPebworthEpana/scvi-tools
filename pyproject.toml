@@ -103,6 +103,7 @@ mlflow = ["mlflow","psutil","GPUtil","nvidia-ml-py"]
 # for rapids
 rapids = [ "cugraph>=24", "cuml>=24", "cupy-cuda12x", "rapids-singlecell[rapids]" ]
 rapids-cuda13 = [ "cugraph>=24", "cuml>=24", "cupy-cuda13x", "rapids-singlecell[rapids]" ]
+mamba = ["mamba-ssm", "causal-conv1d", "einops"]
 
 optional = [
     "scvi-tools[autotune,mlflow,hub,jax,file_sharing,regseq,parallel,interpretability,diagvi]",

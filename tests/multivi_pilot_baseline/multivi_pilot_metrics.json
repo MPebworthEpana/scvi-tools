@@ -1,0 +1,16 @@
+{
+  "dataset": "/home/mppebworth/Documents/Atlas_v3/complex_object_pilot.h5mu",
+  "batch_key": "data_type",
+  "max_epochs": 150,
+  "seed": 0,
+  "n_neighbors": 15,
+  "n_obs": 7341,
+  "n_rna_vars": 2000,
+  "n_atac_vars": 6157,
+  "train_seconds": 158.47,
+  "train_seconds_per_epoch": 1.06,
+  "recon_loss": 3494.889404296875,
+  "kbet_data_type": 0.4198338101076148,
+  "ilisi_data_type": 0.2646734118461609,
+  "silhouette_data_type": -0.007486783899366856
+}
