@@ -13,6 +13,7 @@ def csr_batch_to_tokens(
     coord_table: np.ndarray,
     max_tokens: int,
     genomic: bool = True,
+    genomic_rank: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert a CSR batch slice ``(B, n_peaks)`` into padded token ids and masks."""
     if not sparse.issparse(x_batch):
@@ -28,7 +29,14 @@ def csr_batch_to_tokens(
         if len(indices) == 0:
             tok = {"ids": np.array([], dtype=np.int64)}
         else:
-            tok = tokenize_atac(indices, values, max_tokens, coord_table, genomic=genomic)
+            tok = tokenize_atac(
+                indices,
+                values,
+                max_tokens,
+                coord_table,
+                genomic=genomic,
+                genomic_rank=genomic_rank,
+            )
         row_tokens.append(tok["ids"])
         max_len = max(max_len, len(tok["ids"]))
 

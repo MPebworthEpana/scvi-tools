@@ -5,11 +5,10 @@ from __future__ import annotations
 import copy
 
 import numpy as np
-from torch.utils.data import BatchSampler, RandomSampler, SequentialSampler
+from torch.utils.data import BatchSampler, DataLoader, RandomSampler, SequentialSampler
 
 from scvi import settings
 from scvi.dataloaders._ann_dataloader import AnnDataLoader
-from scvi.dataloaders._mamba_dataset import MambaAnnTorchDataset
 from scvi.dataloaders._samplers import BatchDistributedSampler
 
 
@@ -23,6 +22,7 @@ class MambaAnnDataLoader(AnnDataLoader):
         batch_size: int = 128,
         shuffle: bool = False,
         sampler=None,
+        batch_sampler=None,
         drop_last: bool = False,
         drop_dataset_tail: bool = False,
         data_and_attributes=None,
@@ -38,9 +38,9 @@ class MambaAnnDataLoader(AnnDataLoader):
                 indices = np.where(indices)[0].ravel()
             indices = np.asarray(indices)
         self.indices = indices
-        self.dataset = MambaAnnTorchDataset(
-            adata_manager,
-            getitem_tensors=data_and_attributes,
+        self.dataset = adata_manager.create_mamba_torch_dataset(
+            indices=indices,
+            data_and_attributes=data_and_attributes,
             load_sparse_tensor=load_sparse_tensor,
         )
         if "num_workers" not in kwargs:
@@ -50,10 +50,15 @@ class MambaAnnDataLoader(AnnDataLoader):
 
         self.kwargs = copy.deepcopy(kwargs)
 
-        if sampler is not None and distributed_sampler:
+        if batch_sampler is not None:
+            if sampler is not None or distributed_sampler:
+                raise ValueError("Cannot combine `batch_sampler` with `sampler` or `distributed_sampler`.")
+            for key in ("batch_size", "shuffle", "sampler", "drop_last"):
+                self.kwargs.pop(key, None)
+            self.kwargs["batch_sampler"] = batch_sampler
+        elif sampler is not None and distributed_sampler:
             raise ValueError("Cannot specify both `sampler` and `distributed_sampler`.")
-
-        if sampler is None:
+        elif sampler is None:
             if not distributed_sampler:
                 sampler_cls = SequentialSampler if not shuffle else RandomSampler
                 sampler = BatchSampler(
@@ -69,13 +74,9 @@ class MambaAnnDataLoader(AnnDataLoader):
                     drop_dataset_tail=drop_dataset_tail,
                     shuffle=shuffle,
                 )
-            self.kwargs.update({"batch_size": None, "shuffle": False})
-
-        self.kwargs.update({"sampler": sampler})
+            self.kwargs.update({"batch_size": None, "shuffle": False, "sampler": sampler})
 
         if iter_ndarray:
-            self.kwargs.update({"collate_fn": lambda x: x})
-
-        from torch.utils.data import DataLoader
+            self.kwargs["collate_fn"] = lambda x: x
 
         DataLoader.__init__(self, self.dataset, **self.kwargs)

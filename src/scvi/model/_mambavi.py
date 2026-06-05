@@ -282,6 +282,8 @@ class MAMBAVI(
         n_steps_kl_warmup: int | None = None,
         n_epochs_kl_warmup: int | None = 50,
         adversarial_mixing: bool = True,
+        atac_length_bucketing: bool = False,
+        bucket_mult: int = 50,
         datasplitter_kwargs: dict | None = None,
         plan_kwargs: dict | None = None,
         **kwargs,
@@ -349,6 +351,8 @@ class MAMBAVI(
 
         datasplitter_kwargs = datasplitter_kwargs or {}
         datasplitter_kwargs.setdefault("load_sparse_tensor", True)
+        datasplitter_kwargs.setdefault("atac_length_bucketing", atac_length_bucketing)
+        datasplitter_kwargs.setdefault("bucket_mult", bucket_mult)
 
         data_splitter = self._data_splitter_cls(
             self.adata_manager,
@@ -1166,6 +1170,7 @@ class MAMBAVI(
         modalities: dict[str, str] | None = None,
         max_atac_tokens: int = 8192,
         atac_genomic_sort: bool = True,
+        precompute_atac_tokens: bool = False,
         coord_table=None,
         **kwargs,
     ):
@@ -1317,4 +1322,22 @@ class MAMBAVI(
 
         adata_manager = AnnDataManager(fields=mudata_fields, setup_method_args=setup_method_args)
         adata_manager.register_fields(mdata, **kwargs)
+        if precompute_atac_tokens and modalities.atac_layer is not None:
+            from scvi.data.fields._atac_token_field import AtacTokenConfigField
+            from scvi.encoders._constants import ATAC_TOKEN_CONFIG_KEY
+            from scvi.encoders._precompute_tokens import (
+                precompute_atac_token_sequences,
+                store_precomputed_atac_tokens,
+            )
+
+            token_cfg = adata_manager.get_state_registry(ATAC_TOKEN_CONFIG_KEY)
+            atac_x = adata_manager.get_from_registry(REGISTRY_KEYS.ATAC_X_KEY)
+            precomputed_ids, lengths = precompute_atac_token_sequences(
+                atac_x,
+                token_cfg[AtacTokenConfigField.COORD_TABLE_KEY],
+                token_cfg[AtacTokenConfigField.GENOMIC_RANK_KEY],
+                token_cfg[AtacTokenConfigField.MAX_TOKENS_KEY],
+                genomic=token_cfg[AtacTokenConfigField.GENOMIC_KEY],
+            )
+            store_precomputed_atac_tokens(adata_manager, precomputed_ids, lengths)
         cls.register_manager(adata_manager)
