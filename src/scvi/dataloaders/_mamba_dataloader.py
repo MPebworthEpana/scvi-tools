@@ -51,12 +51,9 @@ class MambaAnnDataLoader(AnnDataLoader):
         self.kwargs = copy.deepcopy(kwargs)
 
         if batch_sampler is not None:
-            if sampler is not None or distributed_sampler:
-                raise ValueError("Cannot combine `batch_sampler` with `sampler` or `distributed_sampler`.")
-            for key in ("batch_size", "shuffle", "sampler", "drop_last"):
-                self.kwargs.pop(key, None)
-            self.kwargs["batch_sampler"] = batch_sampler
-        elif sampler is not None and distributed_sampler:
+            sampler = batch_sampler
+
+        if sampler is not None and distributed_sampler:
             raise ValueError("Cannot specify both `sampler` and `distributed_sampler`.")
         elif sampler is None:
             if not distributed_sampler:
@@ -74,7 +71,7 @@ class MambaAnnDataLoader(AnnDataLoader):
                     drop_dataset_tail=drop_dataset_tail,
                     shuffle=shuffle,
                 )
-            self.kwargs.update({"batch_size": None, "shuffle": False, "sampler": sampler})
+        self.kwargs.update({"batch_size": None, "shuffle": False, "sampler": sampler})
 
         if iter_ndarray:
             self.kwargs["collate_fn"] = lambda x: x

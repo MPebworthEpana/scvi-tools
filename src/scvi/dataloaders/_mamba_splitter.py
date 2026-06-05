@@ -87,7 +87,7 @@ class MambaDataSplitter(DataSplitter):
             self.adata_manager,
             indices=indices,
             shuffle=False,
-            batch_sampler=batch_sampler,
+            sampler=batch_sampler,
             load_sparse_tensor=self.load_sparse_tensor,
             pin_memory=self.pin_memory,
             **loader_kwargs,
