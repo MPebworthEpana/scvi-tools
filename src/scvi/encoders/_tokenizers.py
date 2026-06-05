@@ -18,6 +18,7 @@ def tokenize_atac(
     max_tokens: int,
     coord_table: np.ndarray,
     genomic: bool = True,
+    genomic_rank: np.ndarray | None = None,
 ) -> dict:
     """ATAC: non-zero peaks ordered by ``(chrom, start)``."""
     indices = np.asarray(indices, dtype=np.int64)
@@ -29,7 +30,10 @@ def tokenize_atac(
     chrom = coord_table[indices, 0]
     start = coord_table[indices, 1]
     end = coord_table[indices, 2]
-    order = np.lexsort((start, chrom))
+    if genomic and genomic_rank is not None:
+        order = np.argsort(genomic_rank[indices], kind="stable")
+    else:
+        order = np.lexsort((start, chrom))
 
     return {
         "ids": indices[order],

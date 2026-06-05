@@ -39,3 +39,12 @@ def build_coord_table(peak_names) -> np.ndarray:
     for i, name in enumerate(peak_names):
         out[i] = parse_peak_name(name)
     return out
+
+
+def build_genomic_rank(coord_table: np.ndarray) -> np.ndarray:
+    """Return ``genomic_rank[p]`` = sort order of peak ``p`` by ``(chrom, start)``."""
+    coord_table = np.asarray(coord_table, dtype=np.int64)
+    order = np.lexsort((coord_table[:, 1], coord_table[:, 0]))
+    rank = np.empty(len(order), dtype=np.int64)
+    rank[order] = np.arange(len(order))
+    return rank

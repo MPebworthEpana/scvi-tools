@@ -47,6 +47,9 @@ BATCH_SIZE = 128
 TRAIN_SIZE = 0.85
 N_NEIGHBORS = 15
 MAX_ATAC_TOKENS = 8192
+PRECOMPUTE_TOKENS = True
+LENGTH_BUCKETING = True
+BUCKET_MULT = 50
 
 
 def _neighbors(latent: np.ndarray, n_neighbors: int):
@@ -113,6 +116,7 @@ def main() -> None:
         batch_key=BATCH_KEY,
         modalities={"rna_layer": "RNA", "atac_layer": "ATAC"},
         max_atac_tokens=MAX_ATAC_TOKENS,
+        precompute_atac_tokens=PRECOMPUTE_TOKENS,
     )
     model = scvi.model.MAMBAVI(
         mdata,
@@ -127,6 +131,8 @@ def main() -> None:
         train_size=TRAIN_SIZE,
         accelerator="auto",
         adversarial_mixing=True,
+        atac_length_bucketing=LENGTH_BUCKETING,
+        bucket_mult=BUCKET_MULT,
     )
     train_seconds = time.perf_counter() - t0
     logger.info(
@@ -155,6 +161,9 @@ def main() -> None:
         "n_atac_vars": int(mdata.mod["ATAC"].n_vars),
         "train_seconds": round(train_seconds, 2),
         "train_seconds_per_epoch": round(train_seconds / MAX_EPOCHS, 2),
+        "precompute_atac_tokens": PRECOMPUTE_TOKENS,
+        "atac_length_bucketing": LENGTH_BUCKETING,
+        "bucket_mult": BUCKET_MULT,
         "recon_loss": _last_val(
             model.history,
             ("reconstruction_loss_validation", "validation_loss", "elbo_validation"),
