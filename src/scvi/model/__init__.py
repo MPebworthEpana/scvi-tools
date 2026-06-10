@@ -10,6 +10,7 @@ from ._condscvi import CondSCVI
 from ._destvi import DestVI
 from ._linear_scvi import LinearSCVI
 from ._mambavi import MAMBAVI
+from ._setvi import SETVI
 from ._multivi import MULTIVI
 from ._peakvi import PEAKVI
 from ._scanvi import SCANVI
@@ -28,6 +29,7 @@ __all__ = [
     "DestVI",
     "MAMBAVI",
     "MULTIVI",
+    "SETVI",
     "AmortizedLDA",
     "utils",
     "get_max_epochs_heuristic",

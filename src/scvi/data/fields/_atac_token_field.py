@@ -14,7 +14,7 @@ from ._mudata import BaseMuDataWrapperClass
 
 
 class AtacTokenConfigField(BaseAnnDataField):
-    """Stores ATAC tokenization config; tensors are built in the dataloader."""
+    """Stores ATAC tokenization config; sequences are precomputed at setup."""
 
     COORD_TABLE_KEY = "coord_table"
     GENOMIC_RANK_KEY = "genomic_rank"
@@ -23,6 +23,7 @@ class AtacTokenConfigField(BaseAnnDataField):
     PRECOMPUTED_KEY = "precomputed"
     PRECOMPUTED_IDS_KEY = "precomputed_token_ids"
     PRECOMPUTED_LENGTHS_KEY = "precomputed_token_lengths"
+    NN_LENGTHS_KEY = "nnz_lengths"
 
     def __init__(
         self,

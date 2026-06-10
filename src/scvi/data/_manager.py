@@ -387,6 +387,24 @@ class AnnDataManager:
             dataset = Subset(dataset, indices)
         return dataset
 
+    def create_set_torch_dataset(
+        self,
+        indices: Sequence[int] | Sequence[bool] = None,
+        data_and_attributes: list[str] | dict[str, np.dtype] | None = None,
+        load_sparse_tensor: bool = False,
+    ) -> AnnTorchDataset:
+        """Like :meth:`create_torch_dataset` but uses :class:`~scvi.dataloaders._set_dataset.SetAnnTorchDataset`."""
+        from scvi.dataloaders._set_dataset import SetAnnTorchDataset
+
+        dataset = SetAnnTorchDataset(
+            self,
+            getitem_tensors=data_and_attributes,
+            load_sparse_tensor=load_sparse_tensor,
+        )
+        if indices is not None:
+            dataset = Subset(dataset, indices)
+        return dataset
+
     @staticmethod
     def _get_data_registry_from_registry(registry: dict) -> attrdict:
         data_registry = {}
