@@ -35,6 +35,31 @@ Implementation references:
   LayerNorm and keeping ATAC/RNA posterior scales matched.
 - **PMA with sampling correction**: optional `-log(pi_i)` logit bias for inclusion-reweighted pooling.
 
+## Peak salience from `region_factors`
+
+SETVI always learns per-peak `region_factors` (not user-configurable). `sigmoid(region_factors_j)`
+approximates peak `j`'s open-frequency `f_j`, so `softplus(-region_factors_j) ≈ -log f_j` is the
+peak's surprisal (IDF). The same detached, capped rarity score is reused in three places:
+
+| Use | Where | Formula | Gradients into `region_factors` |
+|-----|-------|---------|--------------------------------|
+| Decoder baseline | `get_reconstruction_loss_accessibility` | `sigma(rf_j)` scales predicted rate | Yes (via `p`) |
+| Encoder attention prior | `_peak_salience_bias` → ISAB/PMA logit bias | `clamp(softplus(-rf_j.detach()), max=C)` | No (detached) |
+| Decoder loss weight | `_peak_salience_recon_weights` | `w_j = 1 + alpha * min(softplus(-rf_j.detach()), C) / C` | No (detached) |
+
+- **`peak_salience_cap` (`C`)**: shared cap on the raw rarity score. A cap of `5.0` corresponds to a
+  frequency floor `exp(-5) ≈ 0.67%`; peaks rarer than that are flattened to avoid noise amplification.
+- **`use_peak_salience_prior`**: toggles the encoder attention prior (default `True`).
+- **`use_recon_salience_weighting`**: toggles per-peak BCE weighting (default `True`). Weights are an
+  **additive boost** in `[1, 1 + recon_salience_alpha]` — common peaks stay at `1`, rare peaks up to
+  `1 + alpha`. Reconstruction gradients through `p` into the decoder and `z` are amplified for rare
+  peaks without down-weighting any peak.
+- **`recon_salience_alpha`**: boost strength (default `4.0` → weights in `[1, 5]`).
+
+Because all `w_j >= 1`, total ATAC reconstruction loss scales up slightly (mean weight in
+`[1, 1+alpha]`), giving a mild extra reconstruction-vs-KL push. No new checkpoint parameters are
+introduced; weights are computed from existing `region_factors`.
+
 ## Token-native ATAC data path
 
 SETVI never ships the wide `(n_obs, n_regions)` sparse ATAC matrix across dataloader workers.

@@ -35,6 +35,8 @@ class SETVAE(MULTIVAE):
         use_sampling_correction: bool = False,
         use_peak_salience_prior: bool = True,
         peak_salience_cap: float = 5.0,
+        use_recon_salience_weighting: bool = True,
+        recon_salience_alpha: float = 4.0,
         **kwargs,
     ):
         self.max_atac_tokens = max_atac_tokens
@@ -47,6 +49,8 @@ class SETVAE(MULTIVAE):
         self.use_sampling_correction = use_sampling_correction
         self.use_peak_salience_prior = use_peak_salience_prior
         self.peak_salience_cap = peak_salience_cap
+        self.use_recon_salience_weighting = use_recon_salience_weighting
+        self.recon_salience_alpha = recon_salience_alpha
         self._coord_table = coord_table
         self._token_store = None
         # SETVI always learns per-peak region_factors; they are shared with the encoder
@@ -101,6 +105,29 @@ class SETVAE(MULTIVAE):
             F.softplus(-self.region_factors.detach()), max=self.peak_salience_cap
         )
         return salience[token_ids]
+
+    def _peak_salience_recon_weights(self) -> torch.Tensor:
+        """Per-peak additive boost for accessibility BCE in ``[1, 1+alpha]``.
+
+        Uses the same detached, capped rarity score as the encoder attention prior.
+        Detached so weights cannot be gamed via region_factors; gradients still flow
+        through ``p`` into the decoder and ``z``.
+        """
+        s = torch.clamp(
+            F.softplus(-self.region_factors.detach()), max=self.peak_salience_cap
+        )
+        s = s / self.peak_salience_cap
+        return 1.0 + self.recon_salience_alpha * s
+
+    def get_reconstruction_loss_accessibility(self, x, p, d):
+        """Computes the reconstruction loss for the accessibility data."""
+        reg_factor = torch.sigmoid(self.region_factors) if self.region_factors is not None else 1
+        per_peak = torch.nn.BCELoss(reduction="none")(
+            p * d * reg_factor, (x > 0).float()
+        )
+        if self.use_recon_salience_weighting and self.region_factors is not None:
+            per_peak = per_peak * self._peak_salience_recon_weights()
+        return per_peak.sum(dim=-1)
 
     @staticmethod
     def _accessibility_target_from_tokens(

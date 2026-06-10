@@ -72,6 +72,9 @@ USE_SAMPLING_CORRECTION = False
 # Cap C = 5.0 -> frequency floor exp(-5) ~= 0.67%; peaks rarer than that are flattened.
 USE_PEAK_SALIENCE_PRIOR = True
 PEAK_SALIENCE_CAP = 5.0
+# Weight per-peak accessibility BCE by the same detached rarity score (additive boost).
+USE_RECON_SALIENCE_WEIGHTING = True
+RECON_SALIENCE_ALPHA = 4.0
 
 MATMUL_PRECISION = "high"
 TRAIN_PRECISION = "32-true"
@@ -661,6 +664,8 @@ def main(
     use_sampling_correction: bool = USE_SAMPLING_CORRECTION,
     use_peak_salience_prior: bool = USE_PEAK_SALIENCE_PRIOR,
     peak_salience_cap: float = PEAK_SALIENCE_CAP,
+    use_recon_salience_weighting: bool = USE_RECON_SALIENCE_WEIGHTING,
+    recon_salience_alpha: float = RECON_SALIENCE_ALPHA,
     tag: str = "",
     mdata_path: Path = MDATA_PATH,
     subset_data_type: str | None = None,
@@ -708,6 +713,8 @@ def main(
         use_sampling_correction=use_sampling_correction,
         use_peak_salience_prior=use_peak_salience_prior,
         peak_salience_cap=peak_salience_cap,
+        use_recon_salience_weighting=use_recon_salience_weighting,
+        recon_salience_alpha=recon_salience_alpha,
     )
 
     alignment_mode = "adversarial" if adversarial else "standard"
@@ -816,6 +823,8 @@ def main(
         "region_factors": region_factors,
         "use_peak_salience_prior": use_peak_salience_prior,
         "peak_salience_cap": peak_salience_cap,
+        "use_recon_salience_weighting": use_recon_salience_weighting,
+        "recon_salience_alpha": recon_salience_alpha,
         "atac_token_store": atac_token_store,
         "csr_token_streaming": False,
         "precompute_atac_tokens": True,
@@ -1041,6 +1050,24 @@ if __name__ == "__main__":
             "freq floor exp(-cap))."
         ),
     )
+    parser.add_argument(
+        "--recon-salience-weighting",
+        action=argparse.BooleanOptionalAction,
+        default=USE_RECON_SALIENCE_WEIGHTING,
+        help=(
+            "Weight per-peak accessibility BCE by detached rarity (additive boost; "
+            "default: True)."
+        ),
+    )
+    parser.add_argument(
+        "--recon-salience-alpha",
+        type=float,
+        default=RECON_SALIENCE_ALPHA,
+        help=(
+            f"Max additive boost on rare-peak BCE: weights in [1, 1+alpha] "
+            f"(default: {RECON_SALIENCE_ALPHA})."
+        ),
+    )
     args = parser.parse_args()
     BATCH_SIZE = args.batch_size
     MAX_ATAC_TOKENS = args.max_atac_tokens
@@ -1070,4 +1097,6 @@ if __name__ == "__main__":
         use_cardinality_film=args.use_cardinality_film,
         use_peak_salience_prior=args.peak_salience_prior,
         peak_salience_cap=args.peak_salience_cap,
+        use_recon_salience_weighting=args.recon_salience_weighting,
+        recon_salience_alpha=args.recon_salience_alpha,
     )
