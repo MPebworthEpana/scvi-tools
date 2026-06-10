@@ -70,6 +70,8 @@ def test_setvi_multimodal_smoke_train():
         accelerator="cpu",
         enable_progress_bar=False,
         early_stopping=False,
+        num_workers=0,
+        atac_length_bucketing=True,
     )
     assert model.is_trained
     latent = model.get_latent_representation()
@@ -88,6 +90,8 @@ def test_setvi_atac_only_smoke_train():
         accelerator="cpu",
         enable_progress_bar=False,
         early_stopping=False,
+        num_workers=0,
+        atac_length_bucketing=True,
     )
     assert model.is_trained
     latent = model.get_latent_representation()
