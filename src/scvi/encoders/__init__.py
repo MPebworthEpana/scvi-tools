@@ -10,6 +10,8 @@ from scvi.encoders._csr_batch_tokenize import csr_batch_to_tokens
 from scvi.encoders._mamba3_encoder import BidirectionalMamba3Encoder
 from scvi.encoders._mamba_atac_variational import MambaAtacVariationalEncoder
 from scvi.encoders._precompute_tokens import atac_row_nnz, precompute_atac_token_sequences
+from scvi.encoders._set_transformer import SetTransformerEncoder
+from scvi.encoders._set_transformer_atac_variational import SetTransformerAtacVariationalEncoder
 from scvi.encoders._tokenizers import tokenize_atac
 
 __all__ = [
@@ -18,6 +20,8 @@ __all__ = [
     "ATAC_TOKEN_MASK_KEY",
     "BidirectionalMamba3Encoder",
     "MambaAtacVariationalEncoder",
+    "SetTransformerAtacVariationalEncoder",
+    "SetTransformerEncoder",
     "atac_row_nnz",
     "build_coord_table",
     "build_genomic_rank",

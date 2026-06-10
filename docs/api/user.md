@@ -32,6 +32,7 @@ import scvi
    model.SCVI
    model.TOTALVI
    model.MULTIVI
+   model.SETVI
    model.AmortizedLDA
    model.JaxSCVI
    model.mlxSCVI

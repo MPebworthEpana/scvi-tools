@@ -9,6 +9,7 @@ from ._classifier import Classifier
 from ._mrdeconv import MRDeconv
 from ._mambavae import MAMBAVAE
 from ._multivae import MULTIVAE
+from ._setvae import SETVAE
 from ._peakvae import PEAKVAE
 from ._scanvae import SCANVAE
 from ._totalvae import TOTALVAE
@@ -27,6 +28,7 @@ __all__ = [
     "MRDeconv",
     "MAMBAVAE",
     "MULTIVAE",
+    "SETVAE",
     "AmortizedLDAPyroModule",
 ]
 
