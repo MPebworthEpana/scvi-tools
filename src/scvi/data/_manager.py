@@ -393,8 +393,8 @@ class AnnDataManager:
         data_and_attributes: list[str] | dict[str, np.dtype] | None = None,
         load_sparse_tensor: bool = False,
     ) -> AnnTorchDataset:
-        """Like :meth:`create_torch_dataset` but uses :class:`~scvi.dataloaders._set_dataset.SetAnnTorchDataset`."""
-        from scvi.dataloaders._set_dataset import SetAnnTorchDataset
+        """Like :meth:`create_torch_dataset` but uses :class:`~scvi.tokenized._dataset.SetAnnTorchDataset`."""
+        from scvi.tokenized._dataset import SetAnnTorchDataset
 
         dataset = SetAnnTorchDataset(
             self,
