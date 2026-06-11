@@ -72,6 +72,7 @@ USE_SAMPLING_CORRECTION = False
 # Cap C = 5.0 -> frequency floor exp(-5) ~= 0.67%; peaks rarer than that are flattened.
 USE_PEAK_SALIENCE_PRIOR = True
 PEAK_SALIENCE_CAP = 5.0
+USE_COUNTS_IN_ENCODER = True
 
 MATMUL_PRECISION = "high"
 TRAIN_PRECISION = "32-true"
@@ -661,6 +662,7 @@ def main(
     use_sampling_correction: bool = USE_SAMPLING_CORRECTION,
     use_peak_salience_prior: bool = USE_PEAK_SALIENCE_PRIOR,
     peak_salience_cap: float = PEAK_SALIENCE_CAP,
+    use_counts_in_encoder: bool = USE_COUNTS_IN_ENCODER,
     tag: str = "",
     mdata_path: Path = MDATA_PATH,
     subset_data_type: str | None = None,
@@ -708,6 +710,7 @@ def main(
         use_sampling_correction=use_sampling_correction,
         use_peak_salience_prior=use_peak_salience_prior,
         peak_salience_cap=peak_salience_cap,
+        use_counts_in_encoder=use_counts_in_encoder,
     )
 
     alignment_mode = "adversarial" if adversarial else "standard"
@@ -826,6 +829,7 @@ def main(
         "st_dropout": st_dropout,
         "use_cardinality_film": use_cardinality_film,
         "use_sampling_correction": use_sampling_correction,
+        "use_counts_in_encoder": use_counts_in_encoder,
         "dataset": str(mdata_path),
         "subset_data_type": subset_data_type,
         "batch_key": BATCH_KEY,
@@ -1041,6 +1045,15 @@ if __name__ == "__main__":
             "freq floor exp(-cap))."
         ),
     )
+    parser.add_argument(
+        "--counts-in-encoder",
+        action=argparse.BooleanOptionalAction,
+        default=USE_COUNTS_IN_ENCODER,
+        help=(
+            "Route ATAC token counts through ValueMLP+log1p in the encoder embedding "
+            f"(default: {USE_COUNTS_IN_ENCODER})."
+        ),
+    )
     args = parser.parse_args()
     BATCH_SIZE = args.batch_size
     MAX_ATAC_TOKENS = args.max_atac_tokens
@@ -1070,4 +1083,5 @@ if __name__ == "__main__":
         use_cardinality_film=args.use_cardinality_film,
         use_peak_salience_prior=args.peak_salience_prior,
         peak_salience_cap=args.peak_salience_cap,
+        use_counts_in_encoder=args.counts_in_encoder,
     )

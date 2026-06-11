@@ -23,6 +23,7 @@ class AtacTokenConfigField(BaseAnnDataField):
     PRECOMPUTED_KEY = "precomputed"
     PRECOMPUTED_IDS_KEY = "precomputed_token_ids"
     PRECOMPUTED_LENGTHS_KEY = "precomputed_token_lengths"
+    PRECOMPUTED_VALUES_KEY = "precomputed_token_values"
     NN_LENGTHS_KEY = "nnz_lengths"
     TOKEN_STORE_KEY = "token_store"
     TOKEN_STORE_HANDLE_KEY = "token_store_handle"
@@ -103,6 +104,10 @@ class AtacTokenConfigField(BaseAnnDataField):
             out[self.PRECOMPUTED_LENGTHS_KEY] = np.asarray(
                 state_registry[self.PRECOMPUTED_LENGTHS_KEY], dtype=np.int64
             )
+            if self.PRECOMPUTED_VALUES_KEY in state_registry:
+                out[self.PRECOMPUTED_VALUES_KEY] = np.asarray(
+                    state_registry[self.PRECOMPUTED_VALUES_KEY], dtype=np.float32
+                )
         return out
 
     def get_summary_stats(self, state_registry: dict) -> dict:

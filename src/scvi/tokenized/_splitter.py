@@ -8,7 +8,12 @@ import torch
 from scvi import settings
 from scvi.data import _constants
 from scvi.dataloaders._data_splitting import DataSplitter
-from scvi.tokenized._constants import ATAC_TOKEN_CONFIG_KEY, ATAC_TOKEN_IDS_KEY, ATAC_TOKEN_MASK_KEY
+from scvi.tokenized._constants import (
+    ATAC_TOKEN_CONFIG_KEY,
+    ATAC_TOKEN_IDS_KEY,
+    ATAC_TOKEN_MASK_KEY,
+    ATAC_TOKEN_VALUES_KEY,
+)
 from scvi.tokenized._dataloader import SetAnnDataLoader
 from scvi.tokenized._field import AtacTokenConfigField
 from scvi.tokenized._length_bucket_sampler import LengthBucketedBatchSampler
@@ -137,7 +142,7 @@ class SetDataSplitter(DataSplitter):
 
     def on_after_batch_transfer(self, batch, dataloader_idx):
         saved = {}
-        for key in (ATAC_TOKEN_IDS_KEY, ATAC_TOKEN_MASK_KEY):
+        for key in (ATAC_TOKEN_IDS_KEY, ATAC_TOKEN_MASK_KEY, ATAC_TOKEN_VALUES_KEY):
             if key in batch:
                 saved[key] = batch.pop(key)
         batch = super().on_after_batch_transfer(batch, dataloader_idx)

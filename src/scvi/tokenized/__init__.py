@@ -4,6 +4,7 @@ from scvi.tokenized._constants import (
     ATAC_TOKEN_CONFIG_KEY,
     ATAC_TOKEN_IDS_KEY,
     ATAC_TOKEN_MASK_KEY,
+    ATAC_TOKEN_VALUES_KEY,
 )
 from scvi.tokenized._coords import (
     build_chrom_vocab,
@@ -31,6 +32,7 @@ from scvi.tokenized._token_store import (
 )
 from scvi.tokenized._set_transformer import (
     CardinalityFiLM,
+    DeepSetEncoder,
     InducedSetAttentionBlock,
     MultiheadAttentionBlock,
     PoolingByMultiheadAttention,
@@ -40,16 +42,19 @@ from scvi.tokenized._set_transformer import (
 from scvi.tokenized._set_transformer_atac_variational import SetTransformerAtacVariationalEncoder
 from scvi.tokenized._splitter import SetDataSplitter
 from scvi.tokenized._store_nnz_lengths import store_atac_nnz_lengths
+from scvi.tokenized._subsample import sample_balanced_atac_loss_indices
 from scvi.tokenized._tokenizers import tokenize_atac
 
 __all__ = [
     "ATAC_TOKEN_CONFIG_KEY",
     "ATAC_TOKEN_IDS_KEY",
     "ATAC_TOKEN_MASK_KEY",
+    "ATAC_TOKEN_VALUES_KEY",
     "AtacPeakEmbedding",
     "AtacTokenConfigField",
     "AtacTokenStore",
     "CardinalityFiLM",
+    "DeepSetEncoder",
     "InducedSetAttentionBlock",
     "LengthBucketedBatchSampler",
     "MuDataAtacTokenField",
@@ -72,6 +77,7 @@ __all__ = [
     "csr_batch_to_tokens",
     "parse_peak_name",
     "precompute_atac_token_sequences",
+    "sample_balanced_atac_loss_indices",
     "store_atac_nnz_lengths",
     "store_precomputed_atac_tokens",
     "tokenize_atac",

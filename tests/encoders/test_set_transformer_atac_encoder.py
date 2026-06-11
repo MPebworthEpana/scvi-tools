@@ -159,6 +159,7 @@ def test_set_dataset_token_native_emits_tokens_without_atac_x():
         ATAC_TOKEN_CONFIG_KEY,
         ATAC_TOKEN_IDS_KEY,
         ATAC_TOKEN_MASK_KEY,
+        ATAC_TOKEN_VALUES_KEY,
         AtacTokenConfigField,
     )
 
@@ -190,6 +191,7 @@ def test_set_dataset_token_native_emits_tokens_without_atac_x():
     batch = next(iter(loader.train_dataloader()))
     assert ATAC_TOKEN_IDS_KEY in batch
     assert ATAC_TOKEN_MASK_KEY in batch
+    assert ATAC_TOKEN_VALUES_KEY in batch
     assert REGISTRY_KEYS.ATAC_X_KEY not in batch
 
 
@@ -303,6 +305,122 @@ def test_vectorized_gather_matches_reference(tier):
             t_ids, t_mask = store.gather_torch(idx, dev, for_encoder=for_encoder)
             np.testing.assert_array_equal(t_ids.cpu().numpy(), ids_r)
             np.testing.assert_array_equal(t_mask.cpu().numpy(), mask_r)
+
+
+def test_token_store_always_retains_values_without_truncation():
+    """Counts are stored even when no row exceeds max_encoder_tokens."""
+    n_regions = 8
+    coord = build_coord_table([f"chr1:{1000 + i * 500}-{1400 + i * 500}" for i in range(n_regions)])
+    rank = build_genomic_rank(coord)
+    x = sp.csr_matrix(
+        [
+            [1, 0, 2, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 3, 0, 1, 0, 0, 0, 0],
+        ],
+        dtype=np.float32,
+    )
+    store = build_token_store(
+        x,
+        coord,
+        rank,
+        max_encoder_tokens=8,
+        genomic=True,
+        tier="ram",
+    )
+    assert not store.truncation_possible
+    assert store.values is not None
+    assert len(store.values) == len(store.ids)
+    for row in range(x.shape[0]):
+        row_csr = x.getrow(row)
+        _, vals = store._row_ids_vals(row)
+        if row_csr.nnz:
+            np.testing.assert_array_equal(vals, row_csr.data.astype(np.float32))
+
+
+@pytest.mark.parametrize("tier", ["ram", "gpu", "mmap"])
+def test_gather_return_values_matches_reference(tier):
+    n_regions = 16
+    coord = build_coord_table([f"chr1:{1000 + i * 500}-{1400 + i * 500}" for i in range(n_regions)])
+    rank = build_genomic_rank(coord)
+    rng = np.random.default_rng(2)
+    rows = []
+    for i in range(12):
+        r = np.zeros(n_regions)
+        nnz = n_regions if i == 0 else rng.integers(1, 8)
+        idx = rng.choice(n_regions, nnz, replace=False)
+        r[idx] = rng.integers(1, 9, nnz)
+        rows.append(r)
+    x = sp.csr_matrix(np.vstack(rows), dtype=np.float32)
+    kwargs = {"tier": tier}
+    if tier == "mmap":
+        kwargs["out_dir"] = tempfile.mkdtemp()
+    store = build_token_store(
+        x,
+        coord,
+        rank,
+        max_encoder_tokens=5,
+        genomic=True,
+        **kwargs,
+    )
+    assert store.values is not None
+    idx = np.array([0, 2, 5, 11], dtype=np.int64)
+    for for_encoder in (True, False):
+        ids_v, mask_v, vals_v = store.gather(
+            idx, for_encoder=for_encoder, return_values=True
+        )
+        ids_r, mask_r, vals_r = store.gather_reference(
+            idx, for_encoder=for_encoder, return_values=True
+        )
+        np.testing.assert_array_equal(ids_v, ids_r)
+        np.testing.assert_array_equal(mask_v, mask_r)
+        np.testing.assert_allclose(vals_v, vals_r)
+        assert np.all(vals_v[~mask_v] == 0.0)
+        if tier == "gpu" and torch.cuda.is_available():
+            dev = torch.device("cuda")
+            t_ids, t_mask, t_vals = store.gather_torch(
+                idx, dev, for_encoder=for_encoder, return_values=True
+            )
+            np.testing.assert_array_equal(t_ids.cpu().numpy(), ids_r)
+            np.testing.assert_array_equal(t_mask.cpu().numpy(), mask_r)
+            np.testing.assert_allclose(t_vals.cpu().numpy(), vals_r)
+        ids_only, mask_only = store.gather(idx, for_encoder=for_encoder, return_values=False)
+        np.testing.assert_array_equal(ids_only, ids_r)
+        np.testing.assert_array_equal(mask_only, mask_r)
+
+
+def test_encoder_forward_with_token_values():
+    coord = build_coord_table([f"chr1:{1000 + i * 500}-{1400 + i * 500}" for i in range(20)])
+    coord_tensor = torch.as_tensor(coord, dtype=torch.long)
+    enc = SetTransformerAtacVariationalEncoder(
+        n_latent=8,
+        coord_table=coord_tensor,
+        n_regions=20,
+        d_model=32,
+        n_layers=1,
+        n_inducing=8,
+        n_heads=4,
+        use_counts_in_encoder=True,
+    )
+    token_ids = torch.tensor([[0, 2, 5, 0, 0], [1, 3, 0, 0, 0]], dtype=torch.long)
+    token_mask = torch.tensor(
+        [[True, True, True, False, False], [True, True, False, False, False]],
+        dtype=torch.bool,
+    )
+    token_values = torch.tensor(
+        [[1.0, 2.0, 3.0, 0.0, 0.0], [4.0, 1.0, 0.0, 0.0, 0.0]],
+        dtype=torch.float32,
+    )
+    batch_index = torch.zeros(2, dtype=torch.long)
+    q_m, q_v, z = enc(
+        token_ids, token_mask, batch_index, token_values=token_values
+    )
+    assert q_m.shape == (2, 8)
+    assert q_v.shape == (2, 8)
+    assert z.shape == (2, 8)
+    assert torch.isfinite(q_m).all()
+    assert torch.isfinite(q_v).all()
+    assert torch.isfinite(z).all()
 
 
 def test_setvi_save_load_roundtrip_latents_and_checkpoint_size():

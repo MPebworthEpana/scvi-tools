@@ -9,7 +9,12 @@ import torch
 
 from scvi import REGISTRY_KEYS
 from scvi.data._anntorchdataset import AnnTorchDataset
-from scvi.tokenized._constants import ATAC_TOKEN_CONFIG_KEY, ATAC_TOKEN_IDS_KEY, ATAC_TOKEN_MASK_KEY
+from scvi.tokenized._constants import (
+    ATAC_TOKEN_CONFIG_KEY,
+    ATAC_TOKEN_IDS_KEY,
+    ATAC_TOKEN_MASK_KEY,
+    ATAC_TOKEN_VALUES_KEY,
+)
 from scvi.tokenized._field import AtacTokenConfigField
 from scvi.tokenized._token_store import AtacTokenStore
 
@@ -68,7 +73,8 @@ class SetAnnTorchDataset(AnnTorchDataset):
         precomputed_ids: np.ndarray,
         lengths: np.ndarray,
         row_indexes: Sequence[int],
-    ) -> tuple[np.ndarray, np.ndarray]:
+        precomputed_values: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         row_indexes = np.asarray(row_indexes, dtype=np.int64)
         batch_ids = precomputed_ids[row_indexes]
         if batch_ids.ndim == 1:
@@ -77,11 +83,19 @@ class SetAnnTorchDataset(AnnTorchDataset):
         max_len = max(int(batch_lengths.max(initial=0)), 1)
         ids = batch_ids[:, :max_len].copy()
         mask = np.zeros((len(row_indexes), max_len), dtype=bool)
+        values = np.zeros((len(row_indexes), max_len), dtype=np.float32)
+        if precomputed_values is not None:
+            batch_values = precomputed_values[row_indexes]
+            if batch_values.ndim == 1:
+                batch_values = batch_values[np.newaxis, :]
+            values = batch_values[:, :max_len].copy()
         for i, n in enumerate(batch_lengths):
             n = int(n)
             if n:
                 mask[i, :n] = True
-        return ids, mask
+                if precomputed_values is None:
+                    values[i, :n] = 1.0
+        return ids, mask, values
 
     def __getitem__(
         self, indexes: int | list[int] | slice
@@ -100,19 +114,25 @@ class SetAnnTorchDataset(AnnTorchDataset):
         if store is not None:
             if store.tier == "gpu":
                 return data_map
-            ids, mask = store.gather(row_indexes, for_encoder=True)
-            data_map[ATAC_TOKEN_IDS_KEY] = ids
-            data_map[ATAC_TOKEN_MASK_KEY] = mask
-            return data_map
-
-        if token_cfg.get(AtacTokenConfigField.PRECOMPUTED_KEY):
-            ids, mask = self._batch_from_precomputed(
-                token_cfg[AtacTokenConfigField.PRECOMPUTED_IDS_KEY],
-                token_cfg[AtacTokenConfigField.PRECOMPUTED_LENGTHS_KEY],
-                row_indexes,
+            ids, mask, values = store.gather(
+                row_indexes, for_encoder=True, return_values=True
             )
             data_map[ATAC_TOKEN_IDS_KEY] = ids
             data_map[ATAC_TOKEN_MASK_KEY] = mask
+            data_map[ATAC_TOKEN_VALUES_KEY] = values
+            return data_map
+
+        if token_cfg.get(AtacTokenConfigField.PRECOMPUTED_KEY):
+            precomputed_values = token_cfg.get(AtacTokenConfigField.PRECOMPUTED_VALUES_KEY)
+            ids, mask, values = self._batch_from_precomputed(
+                token_cfg[AtacTokenConfigField.PRECOMPUTED_IDS_KEY],
+                token_cfg[AtacTokenConfigField.PRECOMPUTED_LENGTHS_KEY],
+                row_indexes,
+                precomputed_values=precomputed_values,
+            )
+            data_map[ATAC_TOKEN_IDS_KEY] = ids
+            data_map[ATAC_TOKEN_MASK_KEY] = mask
+            data_map[ATAC_TOKEN_VALUES_KEY] = values
             return data_map
 
         raise RuntimeError(

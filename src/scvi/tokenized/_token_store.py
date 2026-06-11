@@ -92,7 +92,7 @@ def _resolve_tier(tier: str) -> str:
 
 @dataclass
 class AtacTokenStore:
-    """Ragged int32 token ids with int64 indptr; optional float32 values when truncation is needed."""
+    """Ragged int32 token ids with int64 indptr; float32 per-token counts (always retained)."""
 
     ids: np.ndarray
     indptr: np.ndarray
@@ -126,7 +126,8 @@ class AtacTokenStore:
         cell_idx: np.ndarray,
         *,
         for_encoder: bool,
-    ) -> tuple[np.ndarray, np.ndarray]:
+        return_values: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
         cell_idx = np.asarray(cell_idx, dtype=np.int64).ravel()
         starts = self.indptr[cell_idx]
         lengths = self.indptr[cell_idx + 1] - starts
@@ -141,6 +142,11 @@ class AtacTokenStore:
         gidx_safe = np.clip(gidx, 0, max(len(self.ids) - 1, 0))
         ids_full = np.where(mask, self.ids[gidx_safe], 0).astype(np.int64)
         mask_full = mask
+        values_full = None
+        if return_values:
+            values_full = np.zeros((cell_idx.shape[0], gather_len), dtype=np.float32)
+            if self.values is not None:
+                values_full[mask] = self.values[gidx_safe[mask]]
 
         if (
             for_encoder
@@ -151,7 +157,7 @@ class AtacTokenStore:
             trunc_rows = np.where(lengths > self.max_encoder_tokens)[0]
             for i in trunc_rows:
                 row_ids, row_vals = self._row_ids_vals(int(cell_idx[i]))
-                truncated, _ = _truncate_row(
+                truncated_ids, truncated_vals = _truncate_row(
                     row_ids,
                     row_vals,
                     self.max_encoder_tokens,
@@ -159,15 +165,22 @@ class AtacTokenStore:
                     self.genomic,
                     self.genomic_rank,
                 )
-                n = len(truncated)
+                n = len(truncated_ids)
                 ids_full[i, :] = 0
                 mask_full[i, :] = False
+                if values_full is not None:
+                    values_full[i, :] = 0.0
                 if n:
-                    ids_full[i, :n] = truncated
+                    ids_full[i, :n] = truncated_ids
                     mask_full[i, :n] = True
+                    if values_full is not None:
+                        values_full[i, :n] = truncated_vals
 
         ids = ids_full[:, :out_len]
         mask = mask_full[:, :out_len]
+        if return_values:
+            assert values_full is not None
+            return ids, mask, values_full[:, :out_len]
         return ids, mask
 
     def gather(
@@ -175,25 +188,32 @@ class AtacTokenStore:
         cell_idx: np.ndarray,
         *,
         for_encoder: bool = True,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        return self._gather_vectorized_numpy(cell_idx, for_encoder=for_encoder)
+        return_values: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return self._gather_vectorized_numpy(
+            cell_idx, for_encoder=for_encoder, return_values=return_values
+        )
 
     def gather_reference(
         self,
         cell_idx: np.ndarray,
         *,
         for_encoder: bool = True,
-    ) -> tuple[np.ndarray, np.ndarray]:
+        return_values: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Per-row reference gather for regression tests."""
         cell_idx = np.asarray(cell_idx, dtype=np.int64).ravel()
         max_len = self.max_encoder_tokens if for_encoder else int(self.lengths.max(initial=0))
         max_len = max(max_len, 1)
         ids = np.zeros((len(cell_idx), max_len), dtype=np.int64)
         mask = np.zeros((len(cell_idx), max_len), dtype=bool)
+        values = (
+            np.zeros((len(cell_idx), max_len), dtype=np.float32) if return_values else None
+        )
         for i, row in enumerate(cell_idx):
             row_ids, row_vals = self._row_ids_vals(int(row))
             if for_encoder and self.truncation_possible and len(row_ids) > self.max_encoder_tokens:
-                row_ids, _ = _truncate_row(
+                row_ids, row_vals = _truncate_row(
                     row_ids,
                     row_vals,
                     self.max_encoder_tokens,
@@ -205,6 +225,11 @@ class AtacTokenStore:
             if n:
                 ids[i, :n] = row_ids
                 mask[i, :n] = True
+                if values is not None and row_vals is not None:
+                    values[i, :n] = row_vals
+        if return_values:
+            assert values is not None
+            return ids, mask, values
         return ids, mask
 
     def gather_torch(
@@ -213,13 +238,23 @@ class AtacTokenStore:
         device: torch.device,
         *,
         for_encoder: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_values: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         if self.tier != "gpu":
-            ids, mask = self.gather(cell_idx, for_encoder=for_encoder)
-            return (
+            gathered = self.gather(
+                cell_idx, for_encoder=for_encoder, return_values=return_values
+            )
+            ids, mask = gathered[0], gathered[1]
+            out = (
                 torch.as_tensor(ids, device=device, dtype=torch.long),
                 torch.as_tensor(mask, device=device, dtype=torch.bool),
             )
+            if return_values:
+                out = (*out, torch.as_tensor(gathered[2], device=device, dtype=torch.float32))
+            return out
         if (
             self._torch_ids is None
             or self._torch_indptr is None
@@ -249,6 +284,13 @@ class AtacTokenStore:
         gidx_safe = gidx.clamp(0, max(self._torch_ids.numel() - 1, 0))
         ids_full = torch.zeros(idx.shape[0], gather_len, dtype=torch.long, device=device)
         ids_full[mask_full] = self._torch_ids[gidx_safe[mask_full]].long()
+        values_full = None
+        if return_values:
+            values_full = torch.zeros(
+                idx.shape[0], gather_len, dtype=torch.float32, device=device
+            )
+            if self._torch_values is not None:
+                values_full[mask_full] = self._torch_values[gidx_safe[mask_full]]
 
         if (
             for_encoder
@@ -259,7 +301,7 @@ class AtacTokenStore:
             trunc_rows = torch.where(lengths > self.max_encoder_tokens)[0]
             for i in trunc_rows.cpu().numpy():
                 row_ids, row_vals = self._row_ids_vals(int(cell_idx[i]))
-                truncated, _ = _truncate_row(
+                truncated_ids, truncated_vals = _truncate_row(
                     row_ids,
                     row_vals,
                     self.max_encoder_tokens,
@@ -267,13 +309,26 @@ class AtacTokenStore:
                     self.genomic,
                     self.genomic_rank,
                 )
-                n = len(truncated)
+                n = len(truncated_ids)
                 ids_full[i, :] = 0
                 mask_full[i, :] = False
+                if values_full is not None:
+                    values_full[i, :] = 0.0
                 if n:
-                    ids_full[i, :n] = torch.as_tensor(truncated, device=device, dtype=torch.long)
+                    ids_full[i, :n] = torch.as_tensor(
+                        truncated_ids, device=device, dtype=torch.long
+                    )
                     mask_full[i, :n] = True
-        return ids_full[:, :out_len], mask_full[:, :out_len]
+                    if values_full is not None:
+                        values_full[i, :n] = torch.as_tensor(
+                            truncated_vals, device=device, dtype=torch.float32
+                        )
+        ids_out = ids_full[:, :out_len]
+        mask_out = mask_full[:, :out_len]
+        if return_values:
+            assert values_full is not None
+            return ids_out, mask_out, values_full[:, :out_len]
+        return ids_out, mask_out
 
     def to_handle(self) -> dict[str, Any]:
         return {
@@ -283,6 +338,7 @@ class AtacTokenStore:
             "max_encoder_tokens": self.max_encoder_tokens,
             "genomic": self.genomic,
             "truncation_possible": self.truncation_possible,
+            "has_values": self.values is not None,
             "n_obs": self.n_obs,
         }
 
@@ -391,7 +447,9 @@ def build_token_store(
     content_hash = _content_hash(atac_x)
 
     nnz = atac_row_nnz(atac_x, chunk_size=chunk_size)
-    store_values = int(nnz.max(initial=0)) > max_encoder_tokens
+    keep_values = True
+    truncation_possible = int(nnz.max(initial=0)) > max_encoder_tokens
+    store_values = keep_values
     indptr_arr = np.zeros(n_obs + 1, dtype=np.int64)
     indptr_arr[1:] = np.cumsum(nnz, dtype=np.int64)
     total_ids = int(indptr_arr[-1])
@@ -462,8 +520,8 @@ def build_token_store(
             "n_obs": n_obs,
             "max_encoder_tokens": max_encoder_tokens,
             "genomic": genomic,
-            "truncation_possible": store_values,
-            "has_values": store_values,
+            "truncation_possible": truncation_possible,
+            "has_values": keep_values,
             "content_hash": content_hash,
         }
         with open(mmap_dir / "meta.json", "w") as f:
@@ -487,7 +545,7 @@ def build_token_store(
         genomic_rank=genomic_rank,
         max_encoder_tokens=max_encoder_tokens,
         genomic=genomic,
-        truncation_possible=store_values,
+        truncation_possible=truncation_possible,
         tier=resolved_tier,
         n_obs=n_obs,
         content_hash=content_hash,

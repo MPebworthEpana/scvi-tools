@@ -63,6 +63,7 @@ class SETVI(MULTIVI):
         use_sampling_correction: bool = False,
         use_peak_salience_prior: bool = True,
         peak_salience_cap: float = 5.0,
+        use_counts_in_encoder: bool = True,
         **kwargs,
     ):
         # SETVI always learns per-peak region_factors: they double as the decoder baseline
@@ -90,6 +91,7 @@ class SETVI(MULTIVI):
             use_sampling_correction=use_sampling_correction,
             use_peak_salience_prior=use_peak_salience_prior,
             peak_salience_cap=peak_salience_cap,
+            use_counts_in_encoder=use_counts_in_encoder,
             **kwargs,
         )
         self.init_params_ = self._get_init_params(locals())

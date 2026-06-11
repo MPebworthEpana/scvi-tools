@@ -14,6 +14,7 @@ from scvi.module.base import LossOutput, auto_move_data
 from scvi.tokenized import (
     ATAC_TOKEN_IDS_KEY,
     ATAC_TOKEN_MASK_KEY,
+    ATAC_TOKEN_VALUES_KEY,
     SetTransformerAtacVariationalEncoder,
 )
 
@@ -35,6 +36,7 @@ class SETVAE(MULTIVAE):
         use_sampling_correction: bool = False,
         use_peak_salience_prior: bool = True,
         peak_salience_cap: float = 5.0,
+        use_counts_in_encoder: bool = True,
         **kwargs,
     ):
         self.max_atac_tokens = max_atac_tokens
@@ -47,6 +49,7 @@ class SETVAE(MULTIVAE):
         self.use_sampling_correction = use_sampling_correction
         self.use_peak_salience_prior = use_peak_salience_prior
         self.peak_salience_cap = peak_salience_cap
+        self.use_counts_in_encoder = use_counts_in_encoder
         self._coord_table = coord_table
         self._token_store = None
         # SETVI always learns per-peak region_factors; they are shared with the encoder
@@ -76,6 +79,7 @@ class SETVAE(MULTIVAE):
                 encode_covariates=self.encode_covariates,
                 latent_distribution=self.latent_distribution,
                 binarize=True,
+                use_counts_in_encoder=use_counts_in_encoder,
                 var_eps=0.0,
                 use_cardinality_film=use_cardinality_film,
                 use_sampling_correction=use_sampling_correction,
@@ -118,7 +122,7 @@ class SETVAE(MULTIVAE):
         *,
         for_encoder: bool,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if ATAC_TOKEN_IDS_KEY in tensors and for_encoder:
             ids = tensors[ATAC_TOKEN_IDS_KEY]
             mask = tensors[ATAC_TOKEN_MASK_KEY]
@@ -126,22 +130,32 @@ class SETVAE(MULTIVAE):
                 ids = torch.as_tensor(ids, device=device, dtype=torch.long)
             if not torch.is_tensor(mask):
                 mask = torch.as_tensor(mask, device=device, dtype=torch.bool)
-            return ids.long(), mask.bool()
+            if ATAC_TOKEN_VALUES_KEY in tensors:
+                values = tensors[ATAC_TOKEN_VALUES_KEY]
+                if not torch.is_tensor(values):
+                    values = torch.as_tensor(values, device=device, dtype=torch.float32)
+            else:
+                values = mask.to(dtype=torch.float32)
+            return ids.long(), mask.bool(), values.float()
         if self._token_store is not None and REGISTRY_KEYS.INDICES_KEY in tensors:
             cell_idx = tensors[REGISTRY_KEYS.INDICES_KEY].long().ravel()
             if self._token_store.tier == "gpu":
-                return self._token_store.gather_torch(
+                gathered = self._token_store.gather_torch(
                     cell_idx.cpu().numpy(),
                     device,
                     for_encoder=for_encoder,
+                    return_values=True,
                 )
-            ids, mask = self._token_store.gather(
+                return gathered[0].long(), gathered[1].bool(), gathered[2].float()
+            ids, mask, values = self._token_store.gather(
                 cell_idx.cpu().numpy(),
                 for_encoder=for_encoder,
+                return_values=True,
             )
             return (
                 torch.as_tensor(ids, device=device, dtype=torch.long),
                 torch.as_tensor(mask, device=device, dtype=torch.bool),
+                torch.as_tensor(values, device=device, dtype=torch.float32),
             )
         raise ValueError("SETVAE requires ATAC token tensors or an attached token store.")
 
@@ -180,11 +194,12 @@ class SETVAE(MULTIVAE):
             self._token_store is not None and REGISTRY_KEYS.INDICES_KEY in tensors
         ):
             device = x.device
-            enc_ids, enc_mask = self._resolve_atac_tokens(
+            enc_ids, enc_mask, enc_values = self._resolve_atac_tokens(
                 tensors, for_encoder=True, device=device
             )
             input_dict["atac_token_ids"] = enc_ids
             input_dict["atac_token_mask"] = enc_mask
+            input_dict["atac_token_values"] = enc_values
         return input_dict
 
     @auto_move_data
@@ -200,6 +215,7 @@ class SETVAE(MULTIVAE):
         size_factor,
         atac_token_ids=None,
         atac_token_mask=None,
+        atac_token_values=None,
         n_samples=1,
     ) -> dict[str, torch.Tensor]:
         if self.n_input_genes == 0:
@@ -241,6 +257,7 @@ class SETVAE(MULTIVAE):
                 *categorical_input,
                 cont_covs=cont_covs if self.encode_covariates else None,
                 peak_logit_bias=peak_logit_bias,
+                token_values=atac_token_values,
             )
         else:
             qzm_acc = torch.zeros(x.shape[0], self.n_latent, device=x.device)
@@ -328,7 +345,7 @@ class SETVAE(MULTIVAE):
         x = inference_outputs["x"]
         x_rna = x[:, : self.n_input_genes]
         if self.n_input_regions > 0:
-            tgt_ids, tgt_mask = self._resolve_atac_tokens(
+            tgt_ids, tgt_mask, _tgt_values = self._resolve_atac_tokens(
                 tensors,
                 for_encoder=False,
                 device=generative_outputs["p"].device,

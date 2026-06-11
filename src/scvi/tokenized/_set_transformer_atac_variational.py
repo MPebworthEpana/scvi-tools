@@ -11,7 +11,7 @@ from torch.distributions import Normal
 
 from scvi.nn._base_components import _identity
 from scvi.tokenized._embeddings import AtacPeakEmbedding
-from scvi.tokenized._set_transformer import SetTransformerEncoder
+from scvi.tokenized._set_transformer import DeepSetEncoder, SetTransformerEncoder
 
 
 class SetTransformerAtacVariationalEncoder(nn.Module):
@@ -34,10 +34,15 @@ class SetTransformerAtacVariationalEncoder(nn.Module):
         latent_distribution: str = "normal",
         var_eps: float = 1e-4,
         binarize: bool = True,
+        use_counts_in_encoder: bool = True,
         use_cardinality_film: bool = True,
         use_sampling_correction: bool = False,
+        atac_encoder: str = "settransformer",
+        deepset_pool: str = "mean",
     ):
         super().__init__()
+        if atac_encoder not in ("settransformer", "deepset"):
+            raise ValueError("atac_encoder must be 'settransformer' or 'deepset'")
         self.d_model = d_model
         self.n_latent = n_latent
         self.n_regions = n_regions
@@ -50,23 +55,40 @@ class SetTransformerAtacVariationalEncoder(nn.Module):
         else:
             self.n_cat_list = extra_cats
 
+        self.use_counts_in_encoder = use_counts_in_encoder
         n_chrom = max(int(coord_table[:, 0].max().item()) + 1, 25)
+        if use_counts_in_encoder:
+            binarize_values = False
+            value_as_bias = False
+        else:
+            binarize_values = binarize
+            value_as_bias = True
         self.embedding = AtacPeakEmbedding(
             d_model,
             n_chrom=n_chrom,
-            binarize_values=binarize,
-            value_as_bias=True,
+            binarize_values=binarize_values,
+            value_as_bias=value_as_bias,
         )
         self.embedding.build_static_cache(coord_table.long())
-        self.backbone = SetTransformerEncoder(
-            d_model=d_model,
-            n_layers=n_layers,
-            n_inducing=n_inducing,
-            n_heads=n_heads,
-            dropout=dropout,
-            use_cardinality_film=use_cardinality_film,
-            use_sampling_correction=use_sampling_correction,
-        )
+        if atac_encoder == "deepset":
+            self.backbone = DeepSetEncoder(
+                d_model=d_model,
+                n_phi_layers=n_layers,
+                dropout=dropout,
+                pool=deepset_pool,
+                use_cardinality_film=use_cardinality_film,
+                use_sampling_correction=use_sampling_correction,
+            )
+        else:
+            self.backbone = SetTransformerEncoder(
+                d_model=d_model,
+                n_layers=n_layers,
+                n_inducing=n_inducing,
+                n_heads=n_heads,
+                dropout=dropout,
+                use_cardinality_film=use_cardinality_film,
+                use_sampling_correction=use_sampling_correction,
+            )
         self.head_norm = nn.LayerNorm(d_model)
 
         cov_dim = 0
@@ -112,8 +134,12 @@ class SetTransformerAtacVariationalEncoder(nn.Module):
         *cat_list: torch.Tensor,
         cont_covs: torch.Tensor | None = None,
         peak_logit_bias: torch.Tensor | None = None,
+        token_values: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        values = token_mask.to(token_ids.dtype)
+        if self.use_counts_in_encoder and token_values is not None:
+            values = token_values.float()
+        else:
+            values = token_mask.to(token_ids.dtype)
         tokens = self.embedding.embed_ids(token_ids, values)
         pooled = self.backbone(
             tokens,

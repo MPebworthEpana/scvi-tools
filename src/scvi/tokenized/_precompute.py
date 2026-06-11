@@ -18,8 +18,9 @@ def precompute_atac_token_sequences(
     max_atac_tokens: int,
     genomic: bool = True,
     chunk_size: int = 4096,
+    return_values: bool = False,
     **kwargs,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Build a token store and return legacy padded arrays for backward compatibility."""
     store = build_token_store(
         atac_x,
@@ -36,16 +37,24 @@ def precompute_atac_token_sequences(
     if max_len == 0:
         max_len = 1
     precomputed_ids = np.zeros((store.n_obs, max_len), dtype=np.int64)
+    precomputed_values = np.zeros((store.n_obs, max_len), dtype=np.float32)
     for i in range(store.n_obs):
-        ids, _ = store._row_ids_vals(i)
+        ids, vals = store._row_ids_vals(i)
         n = len(ids)
         if n:
             precomputed_ids[i, :n] = ids
+            if vals is not None:
+                precomputed_values[i, :n] = vals
+    if return_values:
+        return precomputed_ids, lengths, precomputed_values
     return precomputed_ids, lengths
 
 
 def store_precomputed_atac_tokens(
-    adata_manager, precomputed_ids: np.ndarray, lengths: np.ndarray
+    adata_manager,
+    precomputed_ids: np.ndarray,
+    lengths: np.ndarray,
+    precomputed_values: np.ndarray | None = None,
 ) -> None:
     """Legacy registry patch; prefer :func:`attach_token_store_to_registry`."""
     state = adata_manager._registry[_constants._FIELD_REGISTRIES_KEY][ATAC_TOKEN_CONFIG_KEY][
@@ -54,6 +63,10 @@ def store_precomputed_atac_tokens(
     state[AtacTokenConfigField.PRECOMPUTED_KEY] = True
     state[AtacTokenConfigField.PRECOMPUTED_IDS_KEY] = np.asarray(precomputed_ids, dtype=np.int64)
     state[AtacTokenConfigField.PRECOMPUTED_LENGTHS_KEY] = np.asarray(lengths, dtype=np.int64)
+    if precomputed_values is not None:
+        state[AtacTokenConfigField.PRECOMPUTED_VALUES_KEY] = np.asarray(
+            precomputed_values, dtype=np.float32
+        )
 
 
 def build_and_attach_token_store(
