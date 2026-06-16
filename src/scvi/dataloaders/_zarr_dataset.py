@@ -253,6 +253,40 @@ def _zarr_csr_group_path(csr: CSRDataset) -> Path:
     return Path(store_path)
 
 
+def _zarr_dense_array_path(arr: zarr.Array) -> Path:
+    """Extract the on-disk zarr array path from a backed ``zarr.Array``."""
+    if not isinstance(arr, zarr.Array):
+        raise TypeError(f"Expected a zarr.Array, got {type(arr)!r}.")
+    store = arr.store
+    root = getattr(store, "root", None)
+    if root is not None:
+        base = Path(root)
+        array_path = getattr(arr, "path", "") or ""
+        return base / array_path if array_path else base
+
+    store_path = str(getattr(arr, "store_path", ""))
+    if store_path.startswith("file://"):
+        store_path = store_path[7:]
+    if not store_path:
+        raise ValueError("Could not determine zarr array path from zarr.Array.")
+    return Path(store_path)
+
+
+def _infer_matrix_layout(matrix) -> MatrixLayout:
+    """Infer CSR vs dense layout from a backed modality matrix."""
+    if isinstance(matrix, zarr.Array):
+        return "dense"
+    if getattr(matrix, "backend", None) == "zarr" and hasattr(matrix, "group"):
+        try:
+            _zarr_csr_group_path(matrix)
+            return "csr"
+        except (TypeError, ValueError):
+            return "dense"
+    if sp.issparse(matrix):
+        return "csr"
+    return "dense"
+
+
 def matrix_sources_from_backed_mudata(
     mdata: MuData,
     registry_map: dict[str, str],
@@ -263,7 +297,12 @@ def matrix_sources_from_backed_mudata(
     layout: MatrixLayout | Literal["auto"] = "auto",
     store_dir: Path | str | None = None,
 ) -> dict[str, ZarrMatrixSource]:
-    """Build picklable :class:`ZarrMatrixSource` descriptors from a backed MuData."""
+    """Build picklable :class:`ZarrMatrixSource` descriptors from a backed MuData.
+
+    When ``layout='auto'``, each modality's layout (CSR vs dense) is inferred
+    independently, enabling mixed layouts such as RNA CSR + ADT dense in one
+    :class:`ZarrDataset`.
+    """
     expected_n_obs = mdata.n_obs if n_obs is None else n_obs
     resolved_store = Path(store_dir) if store_dir is not None else None
     sources: dict[str, ZarrMatrixSource] = {}
@@ -273,20 +312,7 @@ def matrix_sources_from_backed_mudata(
             raise KeyError(f"Modality {mod_key!r} not found in mdata.mod.")
 
         matrix = mdata.mod[mod_key].X
-        matrix_layout: MatrixLayout
-        if layout == "auto":
-            if sp.issparse(matrix) or getattr(matrix, "backend", None) == "zarr" and hasattr(
-                matrix, "group"
-            ):
-                try:
-                    _zarr_csr_group_path(matrix)
-                    matrix_layout = "csr"
-                except TypeError:
-                    matrix_layout = "dense"
-            else:
-                matrix_layout = "dense"
-        else:
-            matrix_layout = layout
+        matrix_layout: MatrixLayout = _infer_matrix_layout(matrix) if layout == "auto" else layout
 
         if x_suffix:
             if resolved_store is None:
@@ -296,9 +322,13 @@ def matrix_sources_from_backed_mudata(
         elif matrix_layout == "csr":
             x_relpath = str(_zarr_csr_group_path(matrix))
         else:
-            if resolved_store is None:
-                raise ValueError("store_dir is required for dense matrix path inference.")
-            x_relpath = str(resolved_store / "mod" / mod_key / "X_dense")
+            try:
+                x_relpath = str(_zarr_dense_array_path(matrix))
+            except (TypeError, ValueError):
+                if resolved_store is None:
+                    raise ValueError("store_dir is required for dense matrix path inference.")
+                dense_suffix = x_suffix if x_suffix else "_dense"
+                x_relpath = str(resolved_store / "mod" / mod_key / f"X{dense_suffix}")
 
         sources[registry_key] = ZarrMatrixSource(
             registry_key, x_relpath, layout=matrix_layout
@@ -371,12 +401,14 @@ def _validate_matrix_datasets(
 
 
 def _validate_matrix_sources(sources: dict[str, ZarrMatrixSource]) -> None:
-    layouts = {key: source.layout for key, source in sources.items()}
-    if len(set(layouts.values())) > 1:
-        raise ValueError(
-            "Mixed matrix layouts in one ZarrDataset are not supported: "
-            f"{ {k: v for k, v in layouts.items()} }."
-        )
+    if not sources:
+        raise ValueError("`matrix_sources` must contain at least one matrix.")
+    for key, source in sources.items():
+        if source.layout not in ("csr", "dense"):
+            raise ValueError(
+                f"Registry key {key!r} has unsupported layout {source.layout!r}; "
+                "expected 'csr' or 'dense'."
+            )
 
 
 def _validate_csr_datasets(csr_datasets: dict[str, CSRDataset]) -> None:
@@ -386,8 +418,9 @@ def _validate_csr_datasets(csr_datasets: dict[str, CSRDataset]) -> None:
 class ZarrDataset(IterableDataset):
     """EXPERIMENTAL: Stream paired modality batches from zarr-backed CSR or dense matrices.
 
-    Uses sorted within-block reads and a compact shuffle buffer,
-    following the TileDB-SOMA / Census streaming pattern.
+    Each registry key may use a different layout (for example RNA as CSR and ADT as
+    dense ``zarr.Array``). Uses sorted within-block reads and a compact shuffle
+    buffer, following the TileDB-SOMA / Census streaming pattern.
 
     Parameters
     ----------
@@ -481,15 +514,7 @@ class ZarrDataset(IterableDataset):
             self._matrix_datasets = None
             self._matrix_layouts = {k: s.layout for k, s in matrix_sources.items()}
         else:
-            layouts = {
-                key: "csr" if getattr(matrix, "backend", None) == "zarr" else "dense"
-                for key, matrix in matrix_datasets.items()
-            }
-            if len(set(layouts.values())) > 1:
-                raise ValueError(
-                    "Mixed matrix layouts in one ZarrDataset are not supported: "
-                    f"{ {k: v for k, v in layouts.items()} }."
-                )
+            layouts = {key: _infer_matrix_layout(matrix) for key, matrix in matrix_datasets.items()}
             _validate_matrix_datasets(matrix_datasets, layouts)
             self.store_dir = None
             self.matrix_sources = None

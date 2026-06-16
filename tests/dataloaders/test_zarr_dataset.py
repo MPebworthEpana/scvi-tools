@@ -692,23 +692,218 @@ def test_zarr_dataset_dense_multiworker_backed_mudata(dense_zarr_store):
     assert seen == set(indices.tolist())
 
 
-def test_zarr_dataset_rejects_mixed_layouts(dense_zarr_store):
-    mdata, mdata_backed, dense_datasets, store_path = dense_zarr_store
+def test_zarr_dataset_mixed_layout_pairing(dense_zarr_store):
+    """RNA CSR + ATAC dense in one ZarrDataset preserves row pairing."""
+    mdata, mdata_backed, dense_datasets, _ = dense_zarr_store
     csr_datasets = _csr_datasets_from_backed(mdata_backed)
     mixed = {
         REGISTRY_KEYS.X_KEY: csr_datasets[REGISTRY_KEYS.X_KEY],
         REGISTRY_KEYS.ATAC_X_KEY: dense_datasets[REGISTRY_KEYS.ATAC_X_KEY],
     }
-    with pytest.raises(ValueError, match="Mixed matrix layouts"):
-        ZarrDataset(
-            obs_tensors=_obs_tensors(mdata.n_obs),
-            indices=np.arange(mdata.n_obs, dtype=np.int64),
-            matrix_datasets=mixed,
-            batch_size=8,
-            block_size=16,
-            shuffle=False,
-        )
+    rng = np.random.default_rng(99)
+    indices = rng.permutation(mdata.n_obs).astype(np.int64)
 
+    ref_rna = csr_datasets[REGISTRY_KEYS.X_KEY][:].toarray()
+    ref_atac = dense_datasets[REGISTRY_KEYS.ATAC_X_KEY][:]
+
+    ds = ZarrDataset(
+        obs_tensors=_obs_tensors(mdata.n_obs),
+        indices=indices,
+        matrix_datasets=mixed,
+        batch_size=5,
+        block_size=7,
+        shuffle=False,
+        shuffle_buffer_blocks=1,
+        seed=0,
+    )
+    assert ds._matrix_layouts[REGISTRY_KEYS.X_KEY] == "csr"
+    assert ds._matrix_layouts[REGISTRY_KEYS.ATAC_X_KEY] == "dense"
+
+    seen: set[int] = set()
+    for batch in ds:
+        ind_x = batch[REGISTRY_KEYS.INDICES_KEY].view(-1).numpy()
+        rna = batch[REGISTRY_KEYS.X_KEY].numpy()
+        atac = batch[REGISTRY_KEYS.ATAC_X_KEY].numpy()
+        seen.update(ind_x.tolist())
+        for i, row_idx in enumerate(ind_x):
+            np.testing.assert_allclose(rna[i], ref_rna[row_idx], rtol=1e-5)
+            np.testing.assert_allclose(atac[i], ref_atac[row_idx], rtol=1e-5)
+    assert seen == set(indices.tolist())
+
+
+def test_zarr_dataset_mixed_layout_multiworker(dense_zarr_store):
+    """Mixed matrix_sources reopen correctly under num_workers > 0."""
+    mdata, mdata_backed, dense_datasets, store_path = dense_zarr_store
+    csr_datasets = _csr_datasets_from_backed(mdata_backed)
+    mdata_backed.mod["ATAC"].X = dense_datasets[REGISTRY_KEYS.ATAC_X_KEY]
+    registry_map = {
+        REGISTRY_KEYS.X_KEY: "RNA",
+        REGISTRY_KEYS.ATAC_X_KEY: "ATAC",
+    }
+    sources = matrix_sources_from_backed_mudata(
+        mdata_backed,
+        registry_map,
+        layout="auto",
+        store_dir=store_path,
+    )
+    assert sources[REGISTRY_KEYS.X_KEY].layout == "csr"
+    assert sources[REGISTRY_KEYS.ATAC_X_KEY].layout == "dense"
+
+    rng = np.random.default_rng(17)
+    indices = rng.permutation(mdata.n_obs).astype(np.int64)
+    ref_rna = csr_datasets[REGISTRY_KEYS.X_KEY][:].toarray()
+    ref_atac = dense_datasets[REGISTRY_KEYS.ATAC_X_KEY][:]
+
+    ds = ZarrDataset(
+        obs_tensors=_obs_tensors(mdata.n_obs),
+        indices=indices,
+        matrix_sources=sources,
+        batch_size=7,
+        block_size=11,
+        shuffle=False,
+        shuffle_buffer_blocks=1,
+        seed=0,
+    )
+    loader = DataLoader(
+        ds,
+        batch_size=None,
+        num_workers=2,
+        collate_fn=_identity_collate,
+        persistent_workers=False,
+    )
+    seen: set[int] = set()
+    for batch in loader:
+        ind_x = batch[REGISTRY_KEYS.INDICES_KEY].view(-1).numpy()
+        rna = batch[REGISTRY_KEYS.X_KEY].numpy()
+        atac = batch[REGISTRY_KEYS.ATAC_X_KEY].numpy()
+        seen.update(ind_x.tolist())
+        for i, row_idx in enumerate(ind_x):
+            np.testing.assert_allclose(rna[i], ref_rna[row_idx], rtol=1e-5)
+            np.testing.assert_allclose(atac[i], ref_atac[row_idx], rtol=1e-5)
+    assert seen == set(indices.tolist())
+
+
+def _make_rna_protein_mixed_zarr_store(
+    tmp_path,
+    batch_size: int = 32,
+    n_genes: int = 50,
+    n_proteins: int = 20,
+):
+    """Zarr store with RNA CSR and protein dense ``zarr.Array`` on ``.X``."""
+    mdata = synthetic_iid(
+        return_mudata=True,
+        batch_size=batch_size,
+        n_genes=n_genes,
+        n_proteins=n_proteins,
+        n_regions=0,
+        n_batches=2,
+    )
+    mdata.mod["RNA"] = mdata.mod.pop("rna")
+    mdata.update()
+    mdata.mod["RNA"].X = sp.random(
+        mdata.n_obs, mdata.mod["RNA"].n_vars, density=0.2, format="csr", dtype=np.float32
+    )
+
+    store_path = tmp_path / "rna_protein.zarr"
+    mdata.write_zarr(store_path)
+    backed = md.read_zarr(store_path)
+    f = zarr.open(str(store_path), mode="r")
+    x_group = f["mod"]["RNA"]["X"]
+    enc = x_group.attrs.get("encoding-type", "")
+    if enc in ("csr_matrix", "csc_matrix"):
+        backed.mod["RNA"].X = sparse_dataset(x_group)
+
+    protein_mod = "protein_expression"
+    protein_x = mdata.mod[protein_mod].X
+    protein_dense = protein_x.toarray() if sp.issparse(protein_x) else np.asarray(protein_x)
+    dest = store_path / "mod" / protein_mod / "X_dense"
+    arr = zarr.open_array(
+        str(dest),
+        mode="w",
+        shape=protein_dense.shape,
+        chunks=(min(64, mdata.n_obs), protein_dense.shape[1]),
+        dtype="float32",
+    )
+    arr[:] = protein_dense.astype(np.float32, copy=False)
+    backed.mod[protein_mod].X = zarr.open_array(str(dest), mode="r")
+    return mdata, backed, store_path
+
+
+def _attach_protein_dense_zarr(backed: MuData, store_path: Path, mod_key: str = "protein_expression") -> zarr.Array:
+    """Attach dense zarr.Array to protein modality ``.X`` for streaming tests."""
+    dest = store_path / "mod" / mod_key / "X_dense"
+    arr = zarr.open_array(str(dest), mode="r")
+    backed.mod[mod_key].X = arr
+    return arr
+
+
+def test_zarr_datamodule_mixed_rna_protein_auto_layout(tmp_path):
+    """from_backed_mudata infers RNA CSR + protein dense with matrix_layout='auto'."""
+    mdata, mdata_backed, store_path = _make_rna_protein_mixed_zarr_store(tmp_path)
+    protein_dense = np.asarray(mdata.mod["protein_expression"].X)
+    mdata_backed.mod["protein_expression"].X = protein_dense
+    MULTIVI.setup_mudata(
+        mdata_backed,
+        batch_key="batch",
+        modalities={"rna_layer": "RNA", "protein_layer": "protein_expression"},
+    )
+    _attach_protein_dense_zarr(mdata_backed, store_path)
+    model = MULTIVI(mdata_backed)
+    dm = ZarrMultiVIDataModule.from_backed_mudata(
+        mdata_backed,
+        model.adata_manager,
+        train_size=0.8,
+        batch_size=8,
+        block_size=8,
+        shuffle_buffer_blocks=1,
+        num_workers=0,
+        seed=0,
+        matrix_layout="auto",
+        store_dir=store_path,
+    )
+    assert REGISTRY_KEYS.X_KEY in dm.matrix_sources
+    assert REGISTRY_KEYS.PROTEIN_EXP_KEY in dm.matrix_sources
+    assert dm.matrix_sources[REGISTRY_KEYS.X_KEY].layout == "csr"
+    assert dm.matrix_sources[REGISTRY_KEYS.PROTEIN_EXP_KEY].layout == "dense"
+
+    loader = dm.train_dataloader()
+    batch = next(iter(loader))
+    assert batch[REGISTRY_KEYS.X_KEY].shape[0] == batch[REGISTRY_KEYS.PROTEIN_EXP_KEY].shape[0]
+    assert batch[REGISTRY_KEYS.X_KEY].shape[1] == mdata.mod["RNA"].n_vars
+    assert batch[REGISTRY_KEYS.PROTEIN_EXP_KEY].shape[1] == mdata.mod["protein_expression"].n_vars
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_multivi_mixed_rna_protein_datamodule_smoke(tmp_path, num_workers):
+    """MULTIVI trains with RNA CSR + protein dense zarr streaming."""
+    mdata, mdata_backed, store_path = _make_rna_protein_mixed_zarr_store(tmp_path)
+    protein_dense = np.asarray(mdata.mod["protein_expression"].X)
+    mdata_backed.mod["protein_expression"].X = protein_dense
+    MULTIVI.setup_mudata(
+        mdata_backed,
+        batch_key="batch",
+        modalities={"rna_layer": "RNA", "protein_layer": "protein_expression"},
+    )
+    _attach_protein_dense_zarr(mdata_backed, store_path)
+    model = MULTIVI(mdata_backed)
+    dm = ZarrMultiVIDataModule.from_backed_mudata(
+        mdata_backed,
+        model.adata_manager,
+        train_size=0.8,
+        batch_size=16,
+        block_size=16,
+        shuffle_buffer_blocks=2,
+        num_workers=num_workers,
+        seed=0,
+        matrix_layout="auto",
+        store_dir=store_path,
+    )
+    model.train(
+        max_epochs=1,
+        datamodule=dm,
+        early_stopping=False,
+        check_val_every_n_epoch=1,
+    )
 
 @pytest.mark.parametrize("num_workers", [0, 2])
 def test_multivi_dense_zarr_datamodule_smoke(dense_zarr_store, num_workers):

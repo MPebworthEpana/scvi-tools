@@ -6,11 +6,13 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+import zarr
 from scipy.sparse import csr_matrix
 
 import scvi
 from scvi import REGISTRY_KEYS
 from scvi.data import AnnTorchDataset, _constants, synthetic_iid
+from scvi.data._utils import _check_fragment_counts, _check_nonnegative_integers
 from scvi.data.fields import ObsmField, ProteinObsmField
 from scvi.utils import dependencies
 
@@ -546,3 +548,50 @@ def test_backed_anndata_sparse(adata, save_path):
     bd = AnnTorchDataset(adata_manager)
     subset = bd[np.arange(adata.n_obs)]
     assert isinstance(subset["X"], np.ndarray)
+
+
+def test_check_nonnegative_integers_zarr_array(tmp_path):
+    store = tmp_path / "counts.zarr"
+    arr = zarr.open_array(
+        str(store),
+        mode="w",
+        shape=(128, 32),
+        chunks=(64, 32),
+        dtype="int32",
+    )
+    arr[:] = np.random.poisson(3, size=(128, 32))
+    assert _check_nonnegative_integers(arr) is True
+
+    arr[:] = -1
+    assert _check_nonnegative_integers(arr) is False
+
+    float_store = tmp_path / "counts_float.zarr"
+    float_arr = zarr.open_array(
+        str(float_store),
+        mode="w",
+        shape=(128, 32),
+        chunks=(64, 32),
+        dtype="float32",
+    )
+    float_arr[:] = np.random.poisson(3, size=(128, 32)).astype(np.float32)
+    float_arr[0, 1] = 1.5
+    assert _check_nonnegative_integers(float_arr) is False
+
+
+def test_check_fragment_counts_zarr_array(tmp_path):
+    store = tmp_path / "fragments.zarr"
+    arr = zarr.open_array(
+        str(store),
+        mode="w",
+        shape=(128, 64),
+        chunks=(64, 64),
+        dtype="int32",
+    )
+    data = np.ones((128, 64), dtype=np.int32)
+    data[:, ::3] = 2
+    data[:, 1::5] = 3
+    arr[:] = data
+    assert _check_fragment_counts(arr) is True
+
+    arr[:] = 0
+    assert _check_fragment_counts(arr) is False

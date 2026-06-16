@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from anndata import AnnData
+    from lightning.pytorch.core import LightningDataModule
     from torch import Tensor
 
     from scvi._types import AnnOrMuData, Number
@@ -258,6 +259,7 @@ class MULTIVI(
         adversarial_mixing: bool = True,
         datasplitter_kwargs: dict | None = None,
         plan_kwargs: dict | None = None,
+        datamodule: LightningDataModule | None = None,
         **kwargs,
     ):
         """Trains the model using amortized variational inference.
@@ -302,9 +304,14 @@ class MULTIVI(
             modalities.
         datasplitter_kwargs
             Additional keyword arguments passed into :class:`~scvi.dataloaders.DataSplitter`.
+            Not used if ``datamodule`` is passed in.
         plan_kwargs
             Keyword args for :class:`~scvi.train.TrainingPlan`. Keyword arguments passed to
             `train()` will overwrite values present in `plan_kwargs`, when appropriate.
+        datamodule
+            ``EXPERIMENTAL`` A :class:`~lightning.pytorch.core.LightningDataModule` instance
+            (e.g. :class:`~scvi.dataloaders.ZarrMultiVIDataModule`) to use for training in place
+            of the default :class:`~scvi.dataloaders.DataSplitter`.
         **kwargs
             Other keyword args for :class:`~scvi.train.Trainer`.
         """
@@ -321,22 +328,32 @@ class MULTIVI(
         plan_kwargs = merge_kwargs(None, plan_kwargs, name="plan")
         plan_kwargs.update(update_dict)
 
-        datasplitter_kwargs = datasplitter_kwargs or {}
+        custom_datamodule = datamodule is not None
+        if datamodule is None:
+            datasplitter_kwargs = datasplitter_kwargs or {}
+            datamodule = self._data_splitter_cls(
+                self.adata_manager,
+                train_size=train_size,
+                validation_size=validation_size,
+                shuffle_set_split=shuffle_set_split,
+                distributed_sampler=use_distributed_sampler(kwargs.get("strategy", None)),
+                batch_size=batch_size or settings.batch_size,
+                **datasplitter_kwargs,
+            )
+        elif self.module is None:
+            raise ValueError(
+                "When using a custom `datamodule`, initialize the model with "
+                "`MULTIVI(mdata)` before calling `train(datamodule=...)`."
+            )
 
-        data_splitter = self._data_splitter_cls(
-            self.adata_manager,
-            train_size=train_size,
-            validation_size=validation_size,
-            shuffle_set_split=shuffle_set_split,
-            distributed_sampler=use_distributed_sampler(kwargs.get("strategy", None)),
-            batch_size=batch_size or settings.batch_size,
-            **datasplitter_kwargs,
-        )
         training_plan = self._training_plan_cls(self.module, **plan_kwargs)
+        trainer_kwargs = dict(kwargs)
+        if custom_datamodule and "reload_dataloaders_every_n_epochs" not in trainer_kwargs:
+            trainer_kwargs["reload_dataloaders_every_n_epochs"] = 1
         runner = self._train_runner_cls(
             self,
             training_plan=training_plan,
-            data_splitter=data_splitter,
+            data_splitter=datamodule,
             max_epochs=max_epochs,
             accelerator=accelerator,
             devices=devices,
@@ -344,7 +361,7 @@ class MULTIVI(
             check_val_every_n_epoch=check_val_every_n_epoch,
             early_stopping_monitor="reconstruction_loss_validation",
             early_stopping_patience=50,
-            **kwargs,
+            **trainer_kwargs,
         )
         return runner()
 

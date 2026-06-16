@@ -33,11 +33,13 @@ _UNSUPPORTED_COVARIATE_MSG = (
 
 
 class ZarrMultiVIDataModule(pl.LightningDataModule):
-    """EXPERIMENTAL: Stream paired RNA/ATAC batches from zarr-backed CSR or dense stores into MultiVI.
+    """EXPERIMENTAL: Stream paired modality batches from zarr-backed CSR or dense stores into MultiVI.
 
     Use :meth:`from_backed_mudata` to construct this datamodule. The caller must
     supply a MuData whose modality matrices are zarr-backed (CSR ``CSRDataset`` or
-    dense zarr arrays, e.g. from ``mudata.write_zarr`` with backed reopen).
+    dense ``zarr.Array``, e.g. from ``mudata.write_zarr`` with backed reopen).
+    Mixed per-modality layouts (e.g. RNA CSR + ADT dense) are supported when
+    ``matrix_layout='auto'``.
     """
 
     def __init__(
@@ -105,10 +107,20 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
 
         Matrix paths are extracted once in the main process; workers reopen zarr
         handles independently.
+
+        Parameters
+        ----------
+        matrix_layout
+            ``'csr'`` forces CSR for all modalities, ``'dense'`` forces dense for all,
+            and ``'auto'`` infers layout per modality (supports mixed CSR + dense).
         """
         if registry_map is None:
             registry_map = {}
-            for key in (REGISTRY_KEYS.X_KEY, REGISTRY_KEYS.ATAC_X_KEY):
+            for key in (
+                REGISTRY_KEYS.X_KEY,
+                REGISTRY_KEYS.ATAC_X_KEY,
+                REGISTRY_KEYS.PROTEIN_EXP_KEY,
+            ):
                 if key not in adata_manager.data_registry:
                     continue
                 data_loc = adata_manager.data_registry[key]
@@ -124,9 +136,14 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
                     "Pass registry_map={REGISTRY_KEYS.X_KEY: 'RNA', ...} explicitly."
                 )
 
-        layout = "dense" if matrix_layout == "dense" else "csr"
+        if matrix_layout == "dense":
+            layout: str = "dense"
+        elif matrix_layout == "auto":
+            layout = "auto"
+        else:
+            layout = "csr"
 
-        if store_dir is None and layout == "dense":
+        if store_dir is None and layout in ("dense", "auto"):
             candidate = getattr(mdata, "filename", None)
             if isinstance(candidate, (str, Path)):
                 store_dir = candidate
@@ -144,6 +161,15 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
                     "store_dir is required for dense matrix_layout (path to the zarr store)."
                 )
             source_kwargs["store_dir"] = store_dir
+        elif layout == "auto":
+            if x_suffix:
+                if store_dir is None:
+                    raise ValueError(
+                        "store_dir is required when using x_suffix with matrix_layout='auto'."
+                    )
+                source_kwargs["x_suffix"] = x_suffix
+            if store_dir is not None:
+                source_kwargs["store_dir"] = store_dir
 
         sources = matrix_sources_from_backed_mudata(mdata, registry_map, **source_kwargs)
         resolved_store_dir = Path(store_dir) if store_dir is not None else None

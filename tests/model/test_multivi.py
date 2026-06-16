@@ -1,9 +1,14 @@
 import os
+from pathlib import Path
 
 import anndata as ad
+import mudata as md
 import numpy as np
 import pytest
 import scanpy as sc
+import scipy.sparse as sp
+import zarr
+from anndata.io import sparse_dataset
 from mudata import MuData
 
 import scvi
@@ -527,6 +532,67 @@ def test_multivi_wrong_modality_order():
     assert de_expression.shape[0] == n_genes
     de_expression = model.differential_expression(groupby="modality")
     assert de_expression.shape[0] == n_genes * groups
+
+
+def _make_rna_protein_mixed_zarr_store(
+    tmp_path,
+    batch_size: int = 32,
+    n_genes: int = 50,
+    n_proteins: int = 20,
+):
+    """MuData zarr store with RNA CSR and protein dense zarr.Array on ``.X``."""
+    mdata = synthetic_iid(
+        return_mudata=True,
+        batch_size=batch_size,
+        n_genes=n_genes,
+        n_proteins=n_proteins,
+        n_regions=0,
+        n_batches=2,
+    )
+    mdata.mod["RNA"] = mdata.mod.pop("rna")
+    mdata.update()
+    mdata.mod["RNA"].X = sp.random(
+        mdata.n_obs, mdata.mod["RNA"].n_vars, density=0.2, format="csr", dtype=np.float32
+    )
+
+    store_path = Path(tmp_path) / "rna_protein.zarr"
+    mdata.write_zarr(store_path)
+    backed = md.read_zarr(store_path)
+    f = zarr.open(str(store_path), mode="r")
+    x_group = f["mod"]["RNA"]["X"]
+    enc = x_group.attrs.get("encoding-type", "")
+    if enc in ("csr_matrix", "csc_matrix"):
+        backed.mod["RNA"].X = sparse_dataset(x_group)
+
+    protein_mod = "protein_expression"
+    protein_x = mdata.mod[protein_mod].X
+    protein_dense = protein_x.toarray() if sp.issparse(protein_x) else np.asarray(protein_x)
+    dest = store_path / "mod" / protein_mod / "X_dense"
+    arr = zarr.open_array(
+        str(dest),
+        mode="w",
+        shape=protein_dense.shape,
+        chunks=(min(64, mdata.n_obs), protein_dense.shape[1]),
+        dtype="float32",
+    )
+    arr[:] = protein_dense.astype(np.float32, copy=False)
+    backed.mod[protein_mod].X = zarr.open_array(str(dest), mode="r")
+    return mdata, backed, store_path
+
+
+def test_multivi_setup_mudata_rna_csr_protein_dense_zarr(tmp_path):
+    """setup_mudata accepts RNA CSR + protein dense zarr.Array without TypeError."""
+    mdata, mdata_backed, _ = _make_rna_protein_mixed_zarr_store(tmp_path)
+    assert isinstance(mdata_backed.mod["protein_expression"].X, zarr.Array)
+
+    MULTIVI.setup_mudata(
+        mdata_backed,
+        batch_key="batch",
+        modalities={"rna_layer": "RNA", "protein_layer": "protein_expression"},
+    )
+    model = MULTIVI(mdata_backed)
+    assert REGISTRY_KEYS.PROTEIN_EXP_KEY in model.adata_manager.data_registry
+    assert model.summary_stats.n_proteins == mdata.mod["protein_expression"].n_vars
 
 
 @pytest.mark.parametrize("dispersion", ["gene"])

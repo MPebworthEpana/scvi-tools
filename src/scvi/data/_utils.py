@@ -250,11 +250,22 @@ def _check_nonnegative_integers(
     # for backed anndata
     if isinstance(data, h5py.Dataset) or isinstance(data, SparseDataset):
         data = data[:100]
-    elif is_package_installed("dask"):
-        import dask.array as da
+    else:
+        if is_package_installed("dask"):
+            import dask.array as da
 
-        if isinstance(data, da.Array):
-            data = data[:100, :100].compute()
+            if isinstance(data, da.Array):
+                data = data[:100, :100].compute()
+        if is_package_installed("zarr"):
+            import zarr
+
+            if isinstance(data, zarr.Array):
+                n_rows = min(100, data.shape[0])
+                if data.ndim == 1:
+                    data = np.asarray(data[:n_rows])
+                else:
+                    n_cols = min(100, data.shape[1])
+                    data = np.asarray(data[:n_rows, :n_cols])
 
     if isinstance(data, np.ndarray):
         data = data
@@ -331,14 +342,23 @@ def _check_fragment_counts(
             data = data[:400]
         else:
             data = data[:]
-    elif is_package_installed("dask"):
-        import dask.array as da
+    else:
+        if is_package_installed("dask"):
+            import dask.array as da
 
-        if isinstance(data, da.Array):
-            if data.shape[0] >= 400:
-                data = data[:400].compute()
-            else:
-                data = data[:].compute()
+            if isinstance(data, da.Array):
+                if data.shape[0] >= 400:
+                    data = data[:400].compute()
+                else:
+                    data = data[:].compute()
+        if is_package_installed("zarr"):
+            import zarr
+
+            if isinstance(data, zarr.Array):
+                if data.shape[0] >= 400:
+                    data = np.asarray(data[:400])
+                else:
+                    data = np.asarray(data[:])
 
     # check that n_obs is greater than n_to_check
     if data.shape[0] < n_to_check:
