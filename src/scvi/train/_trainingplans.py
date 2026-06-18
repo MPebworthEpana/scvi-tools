@@ -532,7 +532,49 @@ class TrainingPlan(pl.LightningModule):
         )
 
 
-class AdversarialTrainingPlan(TrainingPlan):
+class _AdversarialSkipWarningMixin:
+    """Mixin for skip-warning counters and warning emission in adversarial plans."""
+
+    def _init_skip_warning_state(self) -> None:
+        self._main_skip_streak = 0
+        self._main_skip_total = 0
+        self._cls_skip_streak = 0
+        self._cls_skip_total = 0
+
+    def _should_emit_skip_warning(self) -> bool:
+        trainer = getattr(self, "trainer", None)
+        if trainer is not None and not trainer.is_global_zero:
+            return False
+        return True
+
+    def _warn_skipped_minibatch(
+        self, batch_idx: int, reason: str, streak: int, total: int
+    ) -> None:
+        if not self._should_emit_skip_warning():
+            return
+        warnings.warn(
+            f"{type(self).__name__}: skipping minibatch {batch_idx} ({reason}). "
+            f"consecutive_skips={streak}, total_skips={total}",
+            UserWarning,
+            stacklevel=settings.warnings_stacklevel,
+        )
+
+    def _record_main_skip(self, batch_idx: int, reason: str) -> None:
+        self._main_skip_streak += 1
+        self._main_skip_total += 1
+        self._warn_skipped_minibatch(
+            batch_idx, reason, self._main_skip_streak, self._main_skip_total
+        )
+
+    def _record_cls_skip(self, batch_idx: int, reason: str) -> None:
+        self._cls_skip_streak += 1
+        self._cls_skip_total += 1
+        self._warn_skipped_minibatch(
+            batch_idx, reason, self._cls_skip_streak, self._cls_skip_total
+        )
+
+
+class AdversarialTrainingPlan(_AdversarialSkipWarningMixin, TrainingPlan):
     """Train vaes with adversarial loss option to encourage latent space mixing.
 
     Parameters
@@ -577,6 +619,8 @@ class AdversarialTrainingPlan(TrainingPlan):
         Scaling factor on the adversarial components of the loss.
         By default, adversarial loss is scaled from 1 to 0 following the opposite of
         kl warmup.
+    max_grad_norm
+        Maximum gradient norm for clipping before optimizer steps.
     compile
         Whether to compile the model for faster training
     **loss_kwargs
@@ -604,6 +648,7 @@ class AdversarialTrainingPlan(TrainingPlan):
         lr_min: float = 0,
         adversarial_classifier: bool | Classifier = False,
         scale_adversarial_loss: float | Literal["auto"] = "auto",
+        max_grad_norm: float = 10.0,
         compile: bool = False,
         compile_kwargs: dict | None = None,
         **loss_kwargs,
@@ -646,7 +691,37 @@ class AdversarialTrainingPlan(TrainingPlan):
         else:
             self.adversarial_classifier = adversarial_classifier
         self.scale_adversarial_loss = scale_adversarial_loss
+        self.max_grad_norm = max_grad_norm
         self.automatic_optimization = False
+        self._init_skip_warning_state()
+
+    @staticmethod
+    def _zero_optimizer_grads(*optimizers):
+        """Clear gradients on the given optimizers."""
+        for opt in optimizers:
+            if opt is not None:
+                opt.zero_grad(set_to_none=True)
+
+    def _step_optimizer(
+        self,
+        loss: torch.Tensor,
+        optimizer,
+        params: list[torch.Tensor],
+    ) -> bool:
+        """Backward, clip grads, and step. Returns False if update was skipped."""
+        optimizer.zero_grad(set_to_none=True)
+        self.manual_backward(loss)
+        try:
+            torch.nn.utils.clip_grad_norm_(
+                params,
+                max_norm=self.max_grad_norm,
+                error_if_nonfinite=True,
+            )
+        except RuntimeError:
+            self._zero_optimizer_grads(optimizer)
+            return False
+        optimizer.step()
+        return True
 
     def loss_adversarial_classifier(self, z, batch_index, predict_true_class=True):
         """Loss for adversarial classifier."""
@@ -677,6 +752,7 @@ class AdversarialTrainingPlan(TrainingPlan):
             else self.scale_adversarial_loss
         )
         batch_tensor = batch[REGISTRY_KEYS.BATCH_KEY]
+        device = batch_tensor.device
 
         opts = self.optimizers()
         if not isinstance(opts, list):
@@ -694,6 +770,11 @@ class AdversarialTrainingPlan(TrainingPlan):
             fool_loss = self.loss_adversarial_classifier(z, batch_tensor, False)
             loss += fool_loss * kappa
 
+        if not torch.isfinite(loss).all():
+            self._record_main_skip(batch_idx, "non-finite main loss")
+            self._zero_optimizer_grads(opt1, opt2)
+            return torch.zeros((), device=device)
+
         self.log("train_loss", loss, on_step=self.on_step, on_epoch=self.on_epoch, prog_bar=True)
         if self.on_step:
             self.trainer.logger.log_metrics(
@@ -701,18 +782,33 @@ class AdversarialTrainingPlan(TrainingPlan):
                 step=self.global_step,
             )
         self.compute_and_log_metrics(scvi_loss, self.train_metrics, "train")
-        opt1.zero_grad()
-        self.manual_backward(loss)
-        opt1.step()
+
+        main_params = [p for p in self.module.parameters() if p.requires_grad]
+        if not self._step_optimizer(loss, opt1, main_params):
+            self._record_main_skip(batch_idx, "non-finite main gradients")
+            self._zero_optimizer_grads(opt1, opt2)
+            return torch.zeros((), device=device)
+        self._main_skip_streak = 0
 
         # train adversarial classifier
         # this condition will not be met unless self.adversarial_classifier is not False
         if opt2 is not None:
-            loss = self.loss_adversarial_classifier(z.detach(), batch_tensor, True)
-            loss *= kappa
-            opt2.zero_grad()
-            self.manual_backward(loss)
-            opt2.step()
+            cls_loss = self.loss_adversarial_classifier(z.detach(), batch_tensor, True)
+            cls_loss = cls_loss * kappa
+
+            if not torch.isfinite(cls_loss).all():
+                self._record_cls_skip(batch_idx, "non-finite classifier loss")
+                self._zero_optimizer_grads(opt2)
+                return orig_loss.detach()
+
+            cls_params = [
+                p for p in self.adversarial_classifier.parameters() if p.requires_grad
+            ]
+            if not self._step_optimizer(cls_loss, opt2, cls_params):
+                self._record_cls_skip(batch_idx, "non-finite classifier gradients")
+                self._zero_optimizer_grads(opt2)
+                return orig_loss.detach()
+            self._cls_skip_streak = 0
 
         # next part is for the usage of scib-metrics autotune with scvi
         if scvi_loss.extra_metrics is not None and len(scvi_loss.extra_metrics.keys()) > 0:
@@ -1004,7 +1100,9 @@ class SemiSupervisedTrainingPlan(TrainingPlan):
             self.prepare_scib_autotune(loss_output.extra_metrics, "validation")
 
 
-class SemiSupervisedAdversarialTrainingPlan(SemiSupervisedTrainingPlan):
+class SemiSupervisedAdversarialTrainingPlan(
+    _AdversarialSkipWarningMixin, SemiSupervisedTrainingPlan
+):
     """Lightning module task for SemiSupervised Training with Adversarial Loss.
 
     Parameters
@@ -1053,6 +1151,8 @@ class SemiSupervisedAdversarialTrainingPlan(SemiSupervisedTrainingPlan):
         Scaling factor on the adversarial components of the loss.
         By default, adversarial loss is scaled from 1 to 0 following the opposite of
         kl warmup.
+    max_grad_norm
+        Maximum gradient norm for clipping before optimizer steps.
     **loss_kwargs
         Keyword args to pass to the loss method of the `module`.
         `kl_weight` should not be passed here and is handled automatically.
@@ -1081,6 +1181,7 @@ class SemiSupervisedAdversarialTrainingPlan(SemiSupervisedTrainingPlan):
         lr_min: float = 0,
         adversarial_classifier: bool | Classifier = False,
         scale_adversarial_loss: float | Literal["auto"] = "auto",
+        max_grad_norm: float = 50.0,
         **loss_kwargs,
     ):
         super().__init__(
@@ -1130,7 +1231,30 @@ class SemiSupervisedAdversarialTrainingPlan(SemiSupervisedTrainingPlan):
         else:
             self.adversarial_classifier = adversarial_classifier
         self.scale_adversarial_loss = scale_adversarial_loss
+        self.max_grad_norm = max_grad_norm
         self.automatic_optimization = False
+        self._init_skip_warning_state()
+
+    def _step_optimizer(
+        self,
+        loss: torch.Tensor,
+        optimizer,
+        params: list[torch.Tensor],
+    ) -> bool:
+        """Backward, clip grads, and step. Returns False if update was skipped."""
+        optimizer.zero_grad(set_to_none=True)
+        self.manual_backward(loss)
+        try:
+            torch.nn.utils.clip_grad_norm_(
+                params,
+                max_norm=self.max_grad_norm,
+                error_if_nonfinite=True,
+            )
+        except RuntimeError:
+            AdversarialTrainingPlan._zero_optimizer_grads(optimizer)
+            return False
+        optimizer.step()
+        return True
 
     def loss_adversarial_classifier(self, z, batch_index, predict_true_class=True):
         """Loss for adversarial classifier."""
@@ -1168,6 +1292,7 @@ class SemiSupervisedAdversarialTrainingPlan(SemiSupervisedTrainingPlan):
             else self.scale_adversarial_loss
         )
         batch_tensor = full_dataset[self.key_adversarial].long()
+        device = batch_tensor.device
         opts = self.optimizers()
         if not isinstance(opts, list):
             opt1 = opts
@@ -1194,6 +1319,12 @@ class SemiSupervisedAdversarialTrainingPlan(SemiSupervisedTrainingPlan):
                 on_epoch=self.on_epoch,
                 prog_bar=True,
             )
+
+        if not torch.isfinite(loss).all():
+            self._record_main_skip(batch_idx, "non-finite main loss")
+            AdversarialTrainingPlan._zero_optimizer_grads(opt1, opt2)
+            return torch.zeros((), device=device)
+
         self.log("train_loss", loss, on_step=self.on_step, on_epoch=self.on_epoch, prog_bar=True)
         if self.on_step:
             self.trainer.logger.log_metrics(
@@ -1201,22 +1332,33 @@ class SemiSupervisedAdversarialTrainingPlan(SemiSupervisedTrainingPlan):
                 step=self.global_step,
             )
         self.compute_and_log_metrics(loss_output, self.train_metrics, "train")
-        opt1.zero_grad()
-        self.manual_backward(loss)
-        # Optimized to not yield any None values.
-        torch.nn.utils.clip_grad_norm_(
-            filter(lambda p: p.requires_grad, self.module.parameters()), 50
-        )
-        opt1.step()
+
+        main_params = [p for p in self.module.parameters() if p.requires_grad]
+        if not self._step_optimizer(loss, opt1, main_params):
+            self._record_main_skip(batch_idx, "non-finite main gradients")
+            AdversarialTrainingPlan._zero_optimizer_grads(opt1, opt2)
+            return torch.zeros((), device=device)
+        self._main_skip_streak = 0
 
         # train adversarial classifier
         # this condition will not be met unless self.adversarial_classifier is not False
         if opt2 is not None:
-            loss = self.loss_adversarial_classifier(z.detach(), batch_tensor, True)
-            loss *= kappa
-            opt2.zero_grad()
-            self.manual_backward(loss)
-            opt2.step()
+            cls_loss = self.loss_adversarial_classifier(z.detach(), batch_tensor, True)
+            cls_loss = cls_loss * kappa
+
+            if not torch.isfinite(cls_loss).all():
+                self._record_cls_skip(batch_idx, "non-finite classifier loss")
+                AdversarialTrainingPlan._zero_optimizer_grads(opt2)
+                return orig_loss.detach()
+
+            cls_params = [
+                p for p in self.adversarial_classifier.parameters() if p.requires_grad
+            ]
+            if not self._step_optimizer(cls_loss, opt2, cls_params):
+                self._record_cls_skip(batch_idx, "non-finite classifier gradients")
+                AdversarialTrainingPlan._zero_optimizer_grads(opt2)
+                return orig_loss.detach()
+            self._cls_skip_streak = 0
 
         # next part is for the usage of scib-metrics autotune with scvi
         if loss_output.extra_metrics is not None and len(loss_output.extra_metrics.keys()) > 0:

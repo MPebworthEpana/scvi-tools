@@ -29,6 +29,7 @@ from scvi.model.base import (
     UnsupervisedTrainingMixin,
     VAEMixin,
 )
+from scvi.dataloaders import ZarrMultiVIDataModule
 from scvi.model.base._de_core import _de_core
 from scvi.module import MULTIVAE
 from scvi.train import AdversarialTrainingPlan
@@ -47,6 +48,22 @@ if TYPE_CHECKING:
     from scvi._types import AnnOrMuData, Number
 
 logger = logging.getLogger(__name__)
+
+_DATASPLITTER_ONLY_KWARGS = frozenset({
+    "distributed_sampler",
+    "shuffle_set_split",
+    "load_sparse_tensor",
+    "external_indexing",
+})
+_ZARR_DATAMODULE_KWARGS = frozenset({
+    "block_size",
+    "shuffle_buffer_blocks",
+    "num_workers",
+    "pin_memory",
+    "seed",
+    "drop_last",
+    "persistent_workers",
+})
 
 
 class MULTIVI(
@@ -239,6 +256,59 @@ class MULTIVI(
         self.n_proteins = n_proteins
         self.get_normalized_function_name = "get_normalized_accessibility"
 
+    def _try_auto_zarr_datamodule(
+        self,
+        *,
+        train_size: float | None,
+        validation_size: float | None,
+        batch_size: int,
+        datasplitter_kwargs: dict | None,
+    ) -> ZarrMultiVIDataModule | None:
+        """Return a zarr streaming datamodule when ``mdata`` is fully zarr-backed."""
+        if not isinstance(self.adata, MuData):
+            return None
+
+        datasplitter_kwargs = datasplitter_kwargs or {}
+        splitter_only = _DATASPLITTER_ONLY_KWARGS & datasplitter_kwargs.keys()
+        if splitter_only:
+            logger.debug(
+                "Skipping zarr datamodule auto-selection due to DataSplitter-only kwargs: %s",
+                sorted(splitter_only),
+            )
+            return None
+
+        unsupported = set(datasplitter_kwargs) - _ZARR_DATAMODULE_KWARGS
+        if unsupported:
+            logger.debug(
+                "Skipping zarr datamodule auto-selection due to unsupported kwargs: %s",
+                sorted(unsupported),
+            )
+            return None
+
+        zarr_kwargs = {
+            key: datasplitter_kwargs[key] for key in _ZARR_DATAMODULE_KWARGS & datasplitter_kwargs
+        }
+        resolved_train_size = 0.9 if train_size is None else train_size
+
+        try:
+            datamodule = ZarrMultiVIDataModule.from_backed_mudata(
+                self.adata,
+                self.adata_manager,
+                matrix_layout="auto",
+                train_size=resolved_train_size,
+                validation_size=validation_size,
+                batch_size=batch_size,
+                **zarr_kwargs,
+            )
+        except Exception as exc:
+            logger.debug("Zarr datamodule auto-selection failed: %s", exc)
+            return None
+
+        logger.info(
+            "Detected zarr-backed modality matrices; using ZarrMultiVIDataModule for training."
+        )
+        return datamodule
+
     @devices_dsp.dedent
     def train(
         self,
@@ -303,15 +373,19 @@ class MULTIVI(
             Whether to use adversarial training to penalize the model for umbalanced mixing of
             modalities.
         datasplitter_kwargs
-            Additional keyword arguments passed into :class:`~scvi.dataloaders.DataSplitter`.
-            Not used if ``datamodule`` is passed in.
+            Additional keyword arguments passed into :class:`~scvi.dataloaders.DataSplitter`,
+            or into :class:`~scvi.dataloaders.ZarrMultiVIDataModule` when zarr-backed modality
+            matrices are auto-detected. Not used if ``datamodule`` is passed in.
         plan_kwargs
             Keyword args for :class:`~scvi.train.TrainingPlan`. Keyword arguments passed to
             `train()` will overwrite values present in `plan_kwargs`, when appropriate.
         datamodule
             ``EXPERIMENTAL`` A :class:`~lightning.pytorch.core.LightningDataModule` instance
             (e.g. :class:`~scvi.dataloaders.ZarrMultiVIDataModule`) to use for training in place
-            of the default :class:`~scvi.dataloaders.DataSplitter`.
+            of the default :class:`~scvi.dataloaders.DataSplitter`. When ``None``, training
+            automatically uses :class:`~scvi.dataloaders.ZarrMultiVIDataModule` if all registered
+            modality matrices in ``mdata`` are zarr-backed; otherwise falls back to
+            :class:`~scvi.dataloaders.DataSplitter`.
         **kwargs
             Other keyword args for :class:`~scvi.train.Trainer`.
         """
@@ -328,18 +402,29 @@ class MULTIVI(
         plan_kwargs = merge_kwargs(None, plan_kwargs, name="plan")
         plan_kwargs.update(update_dict)
 
-        custom_datamodule = datamodule is not None
+        user_provided_datamodule = datamodule is not None
+        auto_zarr_datamodule = False
         if datamodule is None:
             datasplitter_kwargs = datasplitter_kwargs or {}
-            datamodule = self._data_splitter_cls(
-                self.adata_manager,
+            resolved_batch_size = batch_size or settings.batch_size
+            datamodule = self._try_auto_zarr_datamodule(
                 train_size=train_size,
                 validation_size=validation_size,
-                shuffle_set_split=shuffle_set_split,
-                distributed_sampler=use_distributed_sampler(kwargs.get("strategy", None)),
-                batch_size=batch_size or settings.batch_size,
-                **datasplitter_kwargs,
+                batch_size=resolved_batch_size,
+                datasplitter_kwargs=datasplitter_kwargs,
             )
+            if datamodule is not None:
+                auto_zarr_datamodule = True
+            else:
+                datamodule = self._data_splitter_cls(
+                    self.adata_manager,
+                    train_size=train_size,
+                    validation_size=validation_size,
+                    shuffle_set_split=shuffle_set_split,
+                    distributed_sampler=use_distributed_sampler(kwargs.get("strategy", None)),
+                    batch_size=resolved_batch_size,
+                    **datasplitter_kwargs,
+                )
         elif self.module is None:
             raise ValueError(
                 "When using a custom `datamodule`, initialize the model with "
@@ -348,7 +433,8 @@ class MULTIVI(
 
         training_plan = self._training_plan_cls(self.module, **plan_kwargs)
         trainer_kwargs = dict(kwargs)
-        if custom_datamodule and "reload_dataloaders_every_n_epochs" not in trainer_kwargs:
+        non_default_datamodule = user_provided_datamodule or auto_zarr_datamodule
+        if non_default_datamodule and "reload_dataloaders_every_n_epochs" not in trainer_kwargs:
             trainer_kwargs["reload_dataloaders_every_n_epochs"] = 1
         runner = self._train_runner_cls(
             self,
