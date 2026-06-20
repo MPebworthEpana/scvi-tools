@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import queue
+import threading
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import scipy.sparse as sp
@@ -23,6 +26,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MatrixLayout = Literal["csr", "dense"]
+EmitMode = Literal["rolling", "flush"]
+
+_PREFETCH_SENTINEL = object()
 
 _INT64_OBS_KEYS = frozenset({
     REGISTRY_KEYS.BATCH_KEY,
@@ -102,9 +108,65 @@ class _MatrixBuffer:
             return blocks[0]
         return np.concatenate(blocks, axis=0)
 
+    def remove_rows(self, row_indices: np.ndarray) -> None:
+        """Remove rows by position within the buffer (after materialize)."""
+        if len(row_indices) == 0:
+            return
+        self.materialize()
+        keep = np.ones(self.n_rows, dtype=bool)
+        keep[np.asarray(row_indices, dtype=np.int64)] = False
+        for key in list(self.matrix_blocks.keys()):
+            stacked = self.stacked_matrix(key)
+            layout = self.matrix_layouts.get(key, "csr")
+            kept = stacked[keep]
+            if layout == "csr" and not sp.isspmatrix_csr(kept):
+                kept = kept.tocsr()
+            self.matrix_blocks[key] = [kept]
+        for key in list(self.obs_blocks.keys()):
+            stacked = self.stacked_obs(key)
+            self.obs_blocks[key] = [stacked[keep]]
+        self.n_rows = int(keep.sum())
+
 
 # Backward-compatible alias used internally before generalization.
 _SparseBuffer = _MatrixBuffer
+
+
+def _min_shuffle_pool_rows(
+    shuffle_buffer_blocks: int,
+    block_size: int,
+    batch_size: int,
+) -> int:
+    """Minimum buffered rows before the rolling shuffle path emits minibatches."""
+    return max(batch_size, shuffle_buffer_blocks * block_size)
+
+
+def _prefetch_from_generator(source: Iterator[Any], *, maxsize: int) -> Iterator[Any]:
+    """Run ``source`` in a background thread and yield items from a bounded queue."""
+    if maxsize < 1:
+        raise ValueError("maxsize must be at least 1.")
+    batch_queue: queue.Queue = queue.Queue(maxsize=maxsize)
+    errors: list[BaseException] = []
+
+    def producer() -> None:
+        try:
+            for item in source:
+                batch_queue.put(item)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            batch_queue.put(_PREFETCH_SENTINEL)
+
+    thread = threading.Thread(target=producer, daemon=True)
+    thread.start()
+    while True:
+        item = batch_queue.get()
+        if item is _PREFETCH_SENTINEL:
+            break
+        yield item
+    thread.join()
+    if errors:
+        raise errors[0]
 
 
 def _identity_collate(batch):
@@ -448,7 +510,18 @@ class ZarrDataset(IterableDataset):
     shuffle
         Whether to shuffle rows via the shuffle buffer (training).
     shuffle_buffer_blocks
-        Number of I/O blocks to accumulate before shuffling and emitting minibatches.
+        Minimum shuffle pool size in rows before emitting minibatches when
+        ``emit_mode='rolling'`` (``max(batch_size, shuffle_buffer_blocks * block_size)``).
+        When ``emit_mode='flush'``, number of I/O blocks to accumulate before
+        flushing all buffered minibatches at once (legacy behavior).
+    emit_mode
+        ``'rolling'`` emits one minibatch at a time once the shuffle pool is large
+        enough; ``'flush'`` retains the legacy flush-all-then-clear behavior.
+    prefetch_queue_depth
+        If positive, queue up to this many densified CPU batches per worker via a
+        background producer thread.
+    block_prefetch_depth
+        If positive, queue up to this many raw zarr blocks ahead of densification.
     seed
         Base random seed.
     epoch
@@ -471,11 +544,20 @@ class ZarrDataset(IterableDataset):
         block_size: int = 4096,
         shuffle: bool = True,
         shuffle_buffer_blocks: int = 16,
+        emit_mode: EmitMode = "rolling",
+        prefetch_queue_depth: int = 0,
+        block_prefetch_depth: int = 0,
         seed: int = 0,
         epoch: int = 0,
         drop_last: bool = False,
     ) -> None:
         super().__init__()
+        if emit_mode not in ("rolling", "flush"):
+            raise ValueError("emit_mode must be 'rolling' or 'flush'.")
+        if prefetch_queue_depth < 0:
+            raise ValueError("prefetch_queue_depth must be >= 0.")
+        if block_prefetch_depth < 0:
+            raise ValueError("block_prefetch_depth must be >= 0.")
         if matrix_datasets is None:
             matrix_datasets = csr_datasets
         if matrix_sources is None:
@@ -487,6 +569,9 @@ class ZarrDataset(IterableDataset):
         self.block_size = block_size
         self.shuffle = shuffle
         self.shuffle_buffer_blocks = shuffle_buffer_blocks
+        self.emit_mode = emit_mode
+        self.prefetch_queue_depth = prefetch_queue_depth
+        self.block_prefetch_depth = block_prefetch_depth
         self.seed = seed
         self.epoch = epoch
         self.drop_last = drop_last
@@ -701,44 +786,169 @@ class ZarrDataset(IterableDataset):
         _, _, worker_id, num_workers = _get_rank_worker_ids()
         return [b for i, b in enumerate(blocks) if i % num_workers == worker_id]
 
-    def __iter__(self):
+    def _min_shuffle_pool_rows(self, rank_n: int) -> int:
+        target = _min_shuffle_pool_rows(
+            self.shuffle_buffer_blocks, self.block_size, self.batch_size
+        )
+        return min(target, rank_n)
+
+    def _plan_blocks(
+        self,
+        rank_indices: np.ndarray,
+        rng: np.random.Generator,
+    ) -> list[tuple[int, int]]:
+        blocks = _iter_contiguous_blocks(len(rank_indices), self.block_size)
+        if self.shuffle:
+            block_order = rng.permutation(len(blocks))
+            blocks = [blocks[i] for i in block_order]
+        return self._partition_blocks(blocks)
+
+    def _draw_shuffled_minibatch(
+        self,
+        buffer: _MatrixBuffer,
+        rng: np.random.Generator,
+    ) -> dict[str, torch.Tensor] | None:
+        if buffer.n_rows < self.batch_size:
+            return None
+        buffer.materialize()
+        chosen = rng.choice(buffer.n_rows, size=self.batch_size, replace=False)
+        batch = self._make_batch(buffer, chosen)
+        buffer.remove_rows(chosen)
+        return batch
+
+    def _yield_tail_batch(
+        self,
+        buffer: _MatrixBuffer,
+        rng: np.random.Generator,
+        *,
+        drop_last: bool,
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        if buffer.n_rows == 0 or drop_last:
+            return
+        buffer.materialize()
+        perm = rng.permutation(buffer.n_rows)
+        yield self._make_batch(buffer, perm)
+
+    def _iter_raw_blocks(
+        self,
+        matrix_datasets: dict[str, CSRDataset | zarr.Array],
+        rank_indices: np.ndarray,
+        blocks: list[tuple[int, int]],
+    ) -> Iterator[dict]:
+        for block_start, block_stop in blocks:
+            row_indices = rank_indices[block_start:block_stop]
+            yield self._read_block(matrix_datasets, row_indices)
+
+    def _iter_prefetched_raw_blocks(
+        self,
+        matrix_datasets: dict[str, CSRDataset | zarr.Array],
+        rank_indices: np.ndarray,
+        blocks: list[tuple[int, int]],
+    ) -> Iterator[dict]:
+        return _prefetch_from_generator(
+            self._iter_raw_blocks(matrix_datasets, rank_indices, blocks),
+            maxsize=self.block_prefetch_depth,
+        )
+
+    def _iter_training_batches_rolling(
+        self,
+        matrix_datasets: dict[str, CSRDataset | zarr.Array],
+        rank_indices: np.ndarray,
+        blocks: list[tuple[int, int]],
+        rng: np.random.Generator,
+        *,
+        drop_last: bool,
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        buffer = _MatrixBuffer()
+        min_pool = self._min_shuffle_pool_rows(len(rank_indices))
+        block_iter = (
+            self._iter_prefetched_raw_blocks(matrix_datasets, rank_indices, blocks)
+            if self.block_prefetch_depth > 0
+            else self._iter_raw_blocks(matrix_datasets, rank_indices, blocks)
+        )
+        for block in block_iter:
+            buffer.append(block, layouts=self._matrix_layouts)
+            if buffer.n_rows >= min_pool:
+                while buffer.n_rows >= self.batch_size:
+                    batch = self._draw_shuffled_minibatch(buffer, rng)
+                    if batch is None:
+                        break
+                    yield batch
+        while buffer.n_rows >= self.batch_size:
+            batch = self._draw_shuffled_minibatch(buffer, rng)
+            if batch is None:
+                break
+            yield batch
+        yield from self._yield_tail_batch(buffer, rng, drop_last=drop_last)
+
+    def _iter_training_batches_flush(
+        self,
+        matrix_datasets: dict[str, CSRDataset | zarr.Array],
+        rank_indices: np.ndarray,
+        blocks: list[tuple[int, int]],
+        rng: np.random.Generator,
+        *,
+        drop_last: bool,
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        buffer = _MatrixBuffer()
+        blocks_in_buffer = 0
+        block_iter = (
+            self._iter_prefetched_raw_blocks(matrix_datasets, rank_indices, blocks)
+            if self.block_prefetch_depth > 0
+            else self._iter_raw_blocks(matrix_datasets, rank_indices, blocks)
+        )
+        for block in block_iter:
+            buffer.append(block, layouts=self._matrix_layouts)
+            blocks_in_buffer += 1
+            if blocks_in_buffer >= self.shuffle_buffer_blocks:
+                yield from self._emit_buffered_batches(buffer, rng, drop_last=drop_last)
+                buffer.clear()
+                blocks_in_buffer = 0
+        if buffer.n_rows > 0:
+            yield from self._emit_buffered_batches(buffer, rng, drop_last=drop_last)
+
+    def _iter_validation_batches(
+        self,
+        matrix_datasets: dict[str, CSRDataset | zarr.Array],
+        rank_indices: np.ndarray,
+        blocks: list[tuple[int, int]],
+    ) -> Iterator[dict[str, torch.Tensor]]:
+        leftover = _MatrixBuffer()
+        block_iter = (
+            self._iter_prefetched_raw_blocks(matrix_datasets, rank_indices, blocks)
+            if self.block_prefetch_depth > 0
+            else self._iter_raw_blocks(matrix_datasets, rank_indices, blocks)
+        )
+        for block in block_iter:
+            leftover.append(block, layouts=self._matrix_layouts)
+            yield from self._emit_streaming_batches(leftover)
+        if leftover.n_rows > 0 and not self.drop_last:
+            yield self._make_batch(leftover, np.arange(leftover.n_rows))
+
+    def _produce_batches(self) -> Iterator[dict[str, torch.Tensor]]:
         matrix_datasets = self._get_matrix_datasets()
         rank_indices = self._rank_indices()
         rng = np.random.default_rng(self.seed + self.epoch * 1_000_003)
 
         _, world_size, _, _ = _get_rank_worker_ids()
-        # Under DDP every rank must emit the same number of batches.
         drop_last = self.drop_last or (self.shuffle and world_size > 1)
-
-        blocks = _iter_contiguous_blocks(len(rank_indices), self.block_size)
-        if self.shuffle:
-            block_order = rng.permutation(len(blocks))
-            blocks = [blocks[i] for i in block_order]
-        blocks = self._partition_blocks(blocks)
+        blocks = self._plan_blocks(rank_indices, rng)
 
         if self.shuffle:
-            buffer = _MatrixBuffer()
-            blocks_in_buffer = 0
-            for block_start, block_stop in blocks:
-                row_indices = rank_indices[block_start:block_stop]
-                block = self._read_block(matrix_datasets, row_indices)
-                buffer.append(block, layouts=self._matrix_layouts)
-                blocks_in_buffer += 1
-
-                if blocks_in_buffer >= self.shuffle_buffer_blocks:
-                    yield from self._emit_buffered_batches(buffer, rng, drop_last=drop_last)
-                    buffer.clear()
-                    blocks_in_buffer = 0
-
-            if buffer.n_rows > 0:
-                yield from self._emit_buffered_batches(buffer, rng, drop_last=drop_last)
+            if self.emit_mode == "flush":
+                yield from self._iter_training_batches_flush(
+                    matrix_datasets, rank_indices, blocks, rng, drop_last=drop_last
+                )
+            else:
+                yield from self._iter_training_batches_rolling(
+                    matrix_datasets, rank_indices, blocks, rng, drop_last=drop_last
+                )
         else:
-            leftover = _MatrixBuffer()
-            for block_start, block_stop in blocks:
-                row_indices = rank_indices[block_start:block_stop]
-                block = self._read_block(matrix_datasets, row_indices)
-                leftover.append(block, layouts=self._matrix_layouts)
-                yield from self._emit_streaming_batches(leftover)
+            yield from self._iter_validation_batches(matrix_datasets, rank_indices, blocks)
 
-            if leftover.n_rows > 0 and not drop_last:
-                yield self._make_batch(leftover, np.arange(leftover.n_rows))
+    def __iter__(self):
+        batches = self._produce_batches()
+        if self.prefetch_queue_depth > 0:
+            yield from _prefetch_from_generator(batches, maxsize=self.prefetch_queue_depth)
+        else:
+            yield from batches

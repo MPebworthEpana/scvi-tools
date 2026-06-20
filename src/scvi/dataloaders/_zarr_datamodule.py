@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Literal
 
 import lightning.pytorch as pl
 import numpy as np
@@ -13,6 +14,7 @@ from torch.utils.data import DataLoader
 from scvi import REGISTRY_KEYS, settings
 from scvi.data._manager import AnnDataManager
 from scvi.data._utils import get_anndata_attribute
+from scvi.dataloaders._cuda_prefetch import maybe_wrap_cuda_prefetch
 from scvi.dataloaders._data_splitting import validate_data_split
 from scvi.dataloaders._zarr_dataset import (
     ZarrCSRSource,
@@ -30,6 +32,8 @@ _UNSUPPORTED_COVARIATE_MSG = (
     "covariates. Pass models without covariate keys, or use the default "
     "AnnData DataSplitter instead."
 )
+
+EmitMode = Literal["rolling", "flush"]
 
 
 class ZarrMultiVIDataModule(pl.LightningDataModule):
@@ -55,8 +59,14 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
         batch_size: int = 128,
         block_size: int = 4096,
         shuffle_buffer_blocks: int = 16,
+        emit_mode: EmitMode = "rolling",
+        prefetch_queue_depth: int = 0,
+        block_prefetch_depth: int = 0,
+        prefetch_factor: int | None = None,
         num_workers: int | None = None,
         pin_memory: bool = False,
+        prefetch_to_gpu: bool = False,
+        cuda_queue_depth: int = 2,
         seed: int = 0,
         drop_last: bool = False,
         persistent_workers: bool | None = None,
@@ -76,8 +86,14 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.block_size = block_size
         self.shuffle_buffer_blocks = shuffle_buffer_blocks
+        self.emit_mode = emit_mode
+        self.prefetch_queue_depth = prefetch_queue_depth
+        self.block_prefetch_depth = block_prefetch_depth
+        self.prefetch_factor = prefetch_factor
         self.num_workers = settings.dl_num_workers if num_workers is None else num_workers
         self.pin_memory = pin_memory
+        self.prefetch_to_gpu = prefetch_to_gpu
+        self.cuda_queue_depth = cuda_queue_depth
         self.seed = seed
         self.drop_last = drop_last
         self._val_persistent_workers = (
@@ -278,9 +294,36 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
             block_size=self.block_size,
             shuffle=shuffle,
             shuffle_buffer_blocks=self.shuffle_buffer_blocks,
+            emit_mode=self.emit_mode,
+            prefetch_queue_depth=self.prefetch_queue_depth,
+            block_prefetch_depth=self.block_prefetch_depth,
             seed=self.seed,
             epoch=epoch,
             drop_last=self.drop_last,
+        )
+
+    def _dataloader_kwargs(self) -> dict:
+        kwargs: dict = {}
+        if self.num_workers > 0:
+            kwargs["prefetch_factor"] = 2 if self.prefetch_factor is None else self.prefetch_factor
+        return kwargs
+
+    def _make_dataloader(self, dataset: ZarrDataset, *, persistent_workers: bool) -> DataLoader:
+        loader = DataLoader(
+            dataset,
+            batch_size=None,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            persistent_workers=persistent_workers and self.num_workers > 0,
+            collate_fn=_identity_collate,
+            **self._dataloader_kwargs(),
+        )
+        return maybe_wrap_cuda_prefetch(
+            loader,
+            prefetch_to_gpu=self.prefetch_to_gpu,
+            cuda_queue_depth=self.cuda_queue_depth,
+            pin_memory=self.pin_memory,
+            load_sparse_tensor=False,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -288,14 +331,7 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
         self._train_dataset = self._make_dataset(self.train_idx, shuffle=True, epoch=epoch)
         # persistent_workers must be False so reload_dataloaders_every_n_epochs
         # recreates loaders and picks up the new epoch for reshuffling.
-        return DataLoader(
-            self._train_dataset,
-            batch_size=None,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            persistent_workers=False,
-            collate_fn=_identity_collate,
-        )
+        return self._make_dataloader(self._train_dataset, persistent_workers=False)
 
     def val_dataloader(self) -> DataLoader:
         if self.n_val == 0:
@@ -303,11 +339,7 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
         self._val_dataset = self._make_dataset(
             self.val_idx, shuffle=False, epoch=self._current_epoch()
         )
-        return DataLoader(
+        return self._make_dataloader(
             self._val_dataset,
-            batch_size=None,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            persistent_workers=self._val_persistent_workers and self.num_workers > 0,
-            collate_fn=_identity_collate,
+            persistent_workers=self._val_persistent_workers,
         )

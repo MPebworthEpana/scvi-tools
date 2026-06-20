@@ -27,7 +27,14 @@ from scvi.model import MULTIVI
 
 def _write_and_open_backed_mudata(mdata: MuData, store_path: Path) -> MuData:
     """Test helper: write MuData to zarr and reopen with zarr-backed CSRDatasets on .X."""
-    mdata.write_zarr(store_path)
+    import anndata
+
+    previous = anndata.settings.allow_write_nullable_strings
+    anndata.settings.allow_write_nullable_strings = True
+    try:
+        mdata.write_zarr(store_path)
+    finally:
+        anndata.settings.allow_write_nullable_strings = previous
     backed = md.read_zarr(store_path)
     f = zarr.open(str(store_path), mode="r")
     for mod in backed.mod:
@@ -56,6 +63,7 @@ def _make_synthetic_zarr_store(
         batch_size=batch_size,
         n_genes=n_genes,
         n_regions=n_regions,
+        n_proteins=0,
         n_batches=2,
     )
     n_obs = mdata.n_obs
@@ -63,8 +71,8 @@ def _make_synthetic_zarr_store(
     atac = mdata.mod["accessibility"]
     rna.X = sp.random(n_obs, n_genes, density=0.2, format="csr", dtype=np.float32)
     atac.X = sp.random(n_obs, n_regions, density=0.15, format="csr", dtype=np.float32)
-    mdata.mod["RNA"] = rna
-    mdata.mod["ATAC"] = atac
+    mdata.mod["RNA"] = mdata.mod.pop("rna")
+    mdata.mod["ATAC"] = mdata.mod.pop("accessibility")
     mdata.update()
     store_path = tmp_path / "mdata.zarr"
     mdata_backed = _write_and_open_backed_mudata(mdata, store_path)
@@ -790,7 +798,7 @@ def _make_rna_protein_mixed_zarr_store(
     n_proteins: int = 20,
 ):
     """Zarr store with RNA CSR and protein dense ``zarr.Array`` on ``.X``."""
-    mdata = synthetic_iid(
+    mdata_raw = synthetic_iid(
         return_mudata=True,
         batch_size=batch_size,
         n_genes=n_genes,
@@ -798,14 +806,28 @@ def _make_rna_protein_mixed_zarr_store(
         n_regions=0,
         n_batches=2,
     )
-    mdata.mod["RNA"] = mdata.mod.pop("rna")
-    mdata.update()
+    # Preserve canonical MULTIVI modality order (RNA before protein) without relying on
+    # mdata._mod reorder, which is unavailable on some mudata versions.
+    mdata = md.MuData(
+        {
+            "RNA": mdata_raw.mod["rna"],
+            "protein_expression": mdata_raw.mod["protein_expression"],
+        }
+    )
+    mdata.obs = mdata_raw.obs.copy()
     mdata.mod["RNA"].X = sp.random(
         mdata.n_obs, mdata.mod["RNA"].n_vars, density=0.2, format="csr", dtype=np.float32
     )
 
     store_path = tmp_path / "rna_protein.zarr"
-    mdata.write_zarr(store_path)
+    import anndata
+
+    previous = anndata.settings.allow_write_nullable_strings
+    anndata.settings.allow_write_nullable_strings = True
+    try:
+        mdata.write_zarr(store_path)
+    finally:
+        anndata.settings.allow_write_nullable_strings = previous
     backed = md.read_zarr(store_path)
     f = zarr.open(str(store_path), mode="r")
     x_group = f["mod"]["RNA"]["X"]
@@ -840,15 +862,13 @@ def _attach_protein_dense_zarr(backed: MuData, store_path: Path, mod_key: str = 
 def test_zarr_datamodule_mixed_rna_protein_auto_layout(tmp_path):
     """from_backed_mudata infers RNA CSR + protein dense with matrix_layout='auto'."""
     mdata, mdata_backed, store_path = _make_rna_protein_mixed_zarr_store(tmp_path)
-    protein_dense = np.asarray(mdata.mod["protein_expression"].X)
-    mdata_backed.mod["protein_expression"].X = protein_dense
     MULTIVI.setup_mudata(
-        mdata_backed,
+        mdata,
         batch_key="batch",
         modalities={"rna_layer": "RNA", "protein_layer": "protein_expression"},
     )
     _attach_protein_dense_zarr(mdata_backed, store_path)
-    model = MULTIVI(mdata_backed)
+    model = MULTIVI(mdata)
     dm = ZarrMultiVIDataModule.from_backed_mudata(
         mdata_backed,
         model.adata_manager,
@@ -877,15 +897,13 @@ def test_zarr_datamodule_mixed_rna_protein_auto_layout(tmp_path):
 def test_multivi_mixed_rna_protein_datamodule_smoke(tmp_path, num_workers):
     """MULTIVI trains with RNA CSR + protein dense zarr streaming."""
     mdata, mdata_backed, store_path = _make_rna_protein_mixed_zarr_store(tmp_path)
-    protein_dense = np.asarray(mdata.mod["protein_expression"].X)
-    mdata_backed.mod["protein_expression"].X = protein_dense
     MULTIVI.setup_mudata(
-        mdata_backed,
+        mdata,
         batch_key="batch",
         modalities={"rna_layer": "RNA", "protein_layer": "protein_expression"},
     )
     _attach_protein_dense_zarr(mdata_backed, store_path)
-    model = MULTIVI(mdata_backed)
+    model = MULTIVI(mdata)
     dm = ZarrMultiVIDataModule.from_backed_mudata(
         mdata_backed,
         model.adata_manager,
@@ -904,6 +922,284 @@ def test_multivi_mixed_rna_protein_datamodule_smoke(tmp_path, num_workers):
         early_stopping=False,
         check_val_every_n_epoch=1,
     )
+
+
+def _collect_indices(ds: ZarrDataset) -> set[int]:
+    seen: set[int] = set()
+    for batch in ds:
+        seen.update(batch[REGISTRY_KEYS.INDICES_KEY].view(-1).tolist())
+    return seen
+
+
+@pytest.mark.parametrize("emit_mode", ["rolling", "flush"])
+def test_zarr_dataset_emit_mode_coverage(zarr_store, emit_mode):
+    mdata, mdata_backed = zarr_store
+    csr_datasets = _csr_datasets_from_backed(mdata_backed)
+    rng = np.random.default_rng(42)
+    indices = rng.permutation(mdata.n_obs).astype(np.int64)
+    ds = ZarrDataset(
+        obs_tensors=_obs_tensors(mdata.n_obs),
+        indices=indices,
+        csr_datasets=csr_datasets,
+        batch_size=7,
+        block_size=11,
+        shuffle=True,
+        shuffle_buffer_blocks=2,
+        emit_mode=emit_mode,
+        seed=42,
+        drop_last=False,
+    )
+    assert _collect_indices(ds) == set(indices.tolist())
+
+
+def test_zarr_dataset_rolling_emit_pairing(zarr_store):
+    mdata, mdata_backed = zarr_store
+    csr_datasets = _csr_datasets_from_backed(mdata_backed)
+    rng = np.random.default_rng(99)
+    indices = rng.permutation(mdata.n_obs).astype(np.int64)
+    ref_rna = csr_datasets[REGISTRY_KEYS.X_KEY][:].toarray()
+    ref_atac = csr_datasets[REGISTRY_KEYS.ATAC_X_KEY][:].toarray()
+    ds = ZarrDataset(
+        obs_tensors=_obs_tensors(mdata.n_obs),
+        indices=indices,
+        csr_datasets=csr_datasets,
+        batch_size=5,
+        block_size=7,
+        shuffle=True,
+        shuffle_buffer_blocks=1,
+        emit_mode="rolling",
+        seed=0,
+    )
+    for batch in ds:
+        ind_x = batch[REGISTRY_KEYS.INDICES_KEY].view(-1).numpy()
+        rna = batch[REGISTRY_KEYS.X_KEY].numpy()
+        atac = batch[REGISTRY_KEYS.ATAC_X_KEY].numpy()
+        for i, row_idx in enumerate(ind_x):
+            np.testing.assert_allclose(rna[i], ref_rna[row_idx], rtol=1e-5)
+            np.testing.assert_allclose(atac[i], ref_atac[row_idx], rtol=1e-5)
+
+
+def test_zarr_dataset_rolling_emit_yields_before_all_blocks_read(zarr_store):
+    """Rolling emit must not wait for all blocks when shuffle_buffer_blocks exceeds block count."""
+    mdata, mdata_backed = zarr_store
+    csr_datasets = _csr_datasets_from_backed(mdata_backed)
+    indices = np.arange(mdata.n_obs, dtype=np.int64)
+    ds = ZarrDataset(
+        obs_tensors=_obs_tensors(mdata.n_obs),
+        indices=indices,
+        csr_datasets=csr_datasets,
+        batch_size=4,
+        block_size=8,
+        shuffle=True,
+        shuffle_buffer_blocks=1,
+        emit_mode="rolling",
+        seed=0,
+    )
+    read_count = 0
+    original_read = ds._read_block
+
+    def counting_read(*args, **kwargs):
+        nonlocal read_count
+        read_count += 1
+        return original_read(*args, **kwargs)
+
+    ds._read_block = counting_read  # type: ignore[method-assign]
+    next(iter(ds))
+    total_blocks = len(list(range(0, mdata.n_obs, 8)))
+    assert read_count < total_blocks
+
+
+def test_zarr_dataset_min_shuffle_pool_rows():
+    from scvi.dataloaders._zarr_dataset import _min_shuffle_pool_rows
+
+    assert _min_shuffle_pool_rows(16, 4096, 128) == 65536
+    assert _min_shuffle_pool_rows(1, 8, 32) == 32
+
+
+@pytest.mark.parametrize("prefetch_queue_depth", [0, 2])
+def test_zarr_dataset_prefetch_queue_coverage(zarr_store, prefetch_queue_depth):
+    mdata, mdata_backed = zarr_store
+    csr_datasets = _csr_datasets_from_backed(mdata_backed)
+    indices = np.arange(mdata.n_obs, dtype=np.int64)
+    ds = ZarrDataset(
+        obs_tensors=_obs_tensors(mdata.n_obs),
+        indices=indices,
+        csr_datasets=csr_datasets,
+        batch_size=6,
+        block_size=10,
+        shuffle=True,
+        shuffle_buffer_blocks=1,
+        emit_mode="rolling",
+        prefetch_queue_depth=prefetch_queue_depth,
+        seed=1,
+    )
+    assert _collect_indices(ds) == set(indices.tolist())
+
+
+def test_zarr_dataset_prefetch_queue_multiworker(zarr_store):
+    _, mdata_backed = zarr_store
+    registry_map = {
+        REGISTRY_KEYS.X_KEY: "RNA",
+        REGISTRY_KEYS.ATAC_X_KEY: "ATAC",
+    }
+    sources = csr_sources_from_backed_mudata(mdata_backed, registry_map)
+    indices = np.arange(mdata_backed.n_obs, dtype=np.int64)
+    ds = ZarrDataset(
+        obs_tensors=_obs_tensors(mdata_backed.n_obs),
+        indices=indices,
+        csr_sources=sources,
+        batch_size=5,
+        block_size=10,
+        shuffle=True,
+        shuffle_buffer_blocks=1,
+        emit_mode="rolling",
+        prefetch_queue_depth=2,
+        seed=0,
+    )
+    loader = DataLoader(
+        ds,
+        batch_size=None,
+        num_workers=2,
+        collate_fn=_identity_collate,
+        prefetch_factor=2,
+    )
+    seen = _collect_indices_from_loader(loader)
+    assert seen == set(indices.tolist())
+
+
+def test_zarr_dataset_prefetch_producer_error(zarr_store):
+    mdata, mdata_backed = zarr_store
+    csr_datasets = _csr_datasets_from_backed(mdata_backed)
+    indices = np.arange(mdata.n_obs, dtype=np.int64)
+    ds = ZarrDataset(
+        obs_tensors=_obs_tensors(mdata.n_obs),
+        indices=indices,
+        csr_datasets=csr_datasets,
+        batch_size=4,
+        block_size=8,
+        shuffle=True,
+        shuffle_buffer_blocks=1,
+        emit_mode="rolling",
+        prefetch_queue_depth=2,
+        seed=0,
+    )
+    calls = 0
+    original_read = ds._read_block
+
+    def failing_read(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated read failure")
+        return original_read(*args, **kwargs)
+
+    ds._read_block = failing_read  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="simulated read failure"):
+        list(ds)
+
+
+@pytest.mark.parametrize("block_prefetch_depth", [0, 1])
+def test_zarr_dataset_block_prefetch_coverage(zarr_store, block_prefetch_depth):
+    mdata, mdata_backed = zarr_store
+    csr_datasets = _csr_datasets_from_backed(mdata_backed)
+    indices = np.arange(mdata.n_obs, dtype=np.int64)
+    ds = ZarrDataset(
+        obs_tensors=_obs_tensors(mdata.n_obs),
+        indices=indices,
+        csr_datasets=csr_datasets,
+        batch_size=6,
+        block_size=10,
+        shuffle=True,
+        shuffle_buffer_blocks=1,
+        emit_mode="rolling",
+        block_prefetch_depth=block_prefetch_depth,
+        seed=2,
+    )
+    assert _collect_indices(ds) == set(indices.tolist())
+
+
+def test_zarr_dataset_block_prefetch_serial_reads(zarr_store):
+    mdata, mdata_backed = zarr_store
+    csr_datasets = _csr_datasets_from_backed(mdata_backed)
+    indices = np.arange(mdata.n_obs, dtype=np.int64)
+    ds = ZarrDataset(
+        obs_tensors=_obs_tensors(mdata.n_obs),
+        indices=indices,
+        csr_datasets=csr_datasets,
+        batch_size=4,
+        block_size=8,
+        shuffle=True,
+        shuffle_buffer_blocks=1,
+        emit_mode="rolling",
+        block_prefetch_depth=1,
+        seed=0,
+    )
+    active_reads = 0
+    max_active = 0
+    original_read = ds._read_block
+
+    def tracked_read(*args, **kwargs):
+        nonlocal active_reads, max_active
+        active_reads += 1
+        max_active = max(max_active, active_reads)
+        try:
+            return original_read(*args, **kwargs)
+        finally:
+            active_reads -= 1
+
+    ds._read_block = tracked_read  # type: ignore[method-assign]
+    list(ds)
+    assert max_active == 1
+
+
+def test_zarr_datamodule_prefetch_to_gpu_requires_pin_memory(zarr_store):
+    mdata, mdata_backed = zarr_store
+    MULTIVI.setup_mudata(
+        mdata,
+        batch_key="batch",
+        modalities={"rna_layer": "RNA", "atac_layer": "ATAC"},
+    )
+    model = MULTIVI(mdata)
+    dm = ZarrMultiVIDataModule.from_backed_mudata(
+        mdata_backed,
+        model.adata_manager,
+        num_workers=0,
+        pin_memory=False,
+        prefetch_to_gpu=True,
+    )
+    with pytest.raises(ValueError, match="pin_memory=True"):
+        dm.train_dataloader()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_zarr_datamodule_prefetch_to_gpu_smoke(zarr_store):
+    mdata, mdata_backed = zarr_store
+    MULTIVI.setup_mudata(
+        mdata,
+        batch_key="batch",
+        modalities={"rna_layer": "RNA", "atac_layer": "ATAC"},
+    )
+    model = MULTIVI(mdata)
+    dm = ZarrMultiVIDataModule.from_backed_mudata(
+        mdata_backed,
+        model.adata_manager,
+        train_size=0.8,
+        batch_size=8,
+        block_size=8,
+        shuffle_buffer_blocks=1,
+        emit_mode="rolling",
+        prefetch_queue_depth=2,
+        num_workers=0,
+        pin_memory=True,
+        prefetch_to_gpu=True,
+        cuda_queue_depth=2,
+        seed=0,
+    )
+    loader = dm.train_dataloader()
+    batch = next(iter(loader))
+    assert batch[REGISTRY_KEYS.X_KEY].is_cuda
+    assert batch[REGISTRY_KEYS.ATAC_X_KEY].is_cuda
+
 
 @pytest.mark.parametrize("num_workers", [0, 2])
 def test_multivi_dense_zarr_datamodule_smoke(dense_zarr_store, num_workers):

@@ -19,6 +19,12 @@ The limitations of MultiVI include:
 -   {doc}`/tutorials/notebooks/multimodal/MultiVI_tutorial`
 ```
 
+```{topic} Large-scale / zarr-backed training:
+
+-   {doc}`/user_guide/use_case/zarr_multivi_streaming` — stream zarr-backed MuData without loading
+    full matrices into memory (including RNA CSR + dense ADT/protein)
+```
+
 ## Preliminaries
 
 MultiVI takes as input a multiome single-cell matrix $X_{mult}$ with $N$ cells and $G$ genes and

@@ -58,8 +58,14 @@ _DATASPLITTER_ONLY_KWARGS = frozenset({
 _ZARR_DATAMODULE_KWARGS = frozenset({
     "block_size",
     "shuffle_buffer_blocks",
+    "emit_mode",
+    "prefetch_queue_depth",
+    "block_prefetch_depth",
+    "prefetch_factor",
     "num_workers",
     "pin_memory",
+    "prefetch_to_gpu",
+    "cuda_queue_depth",
     "seed",
     "drop_last",
     "persistent_workers",
@@ -286,7 +292,8 @@ class MULTIVI(
             return None
 
         zarr_kwargs = {
-            key: datasplitter_kwargs[key] for key in _ZARR_DATAMODULE_KWARGS & datasplitter_kwargs
+            key: datasplitter_kwargs[key]
+            for key in _ZARR_DATAMODULE_KWARGS & datasplitter_kwargs.keys()
         }
         resolved_train_size = 0.9 if train_size is None else train_size
 
@@ -416,14 +423,20 @@ class MULTIVI(
             if datamodule is not None:
                 auto_zarr_datamodule = True
             else:
+                splitter_kwargs = dict(datasplitter_kwargs)
                 datamodule = self._data_splitter_cls(
                     self.adata_manager,
                     train_size=train_size,
                     validation_size=validation_size,
-                    shuffle_set_split=shuffle_set_split,
-                    distributed_sampler=use_distributed_sampler(kwargs.get("strategy", None)),
+                    shuffle_set_split=splitter_kwargs.pop(
+                        "shuffle_set_split", shuffle_set_split
+                    ),
+                    distributed_sampler=splitter_kwargs.pop(
+                        "distributed_sampler",
+                        use_distributed_sampler(kwargs.get("strategy", None)),
+                    ),
                     batch_size=resolved_batch_size,
-                    **datasplitter_kwargs,
+                    **splitter_kwargs,
                 )
         elif self.module is None:
             raise ValueError(

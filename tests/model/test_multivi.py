@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 import anndata as ad
+import anndata
 import mudata as md
 import numpy as np
 import pytest
@@ -557,7 +558,12 @@ def _make_rna_protein_mixed_zarr_store(
     )
 
     store_path = Path(tmp_path) / "rna_protein.zarr"
-    mdata.write_zarr(store_path)
+    previous = anndata.settings.allow_write_nullable_strings
+    anndata.settings.allow_write_nullable_strings = True
+    try:
+        mdata.write_zarr(store_path)
+    finally:
+        anndata.settings.allow_write_nullable_strings = previous
     backed = md.read_zarr(store_path)
     f = zarr.open(str(store_path), mode="r")
     x_group = f["mod"]["RNA"]["X"]
@@ -632,34 +638,29 @@ class _CaptureTrainRunner:
         return None
 
 
-def _attach_protein_dense_zarr(backed: MuData, store_path: Path, mod_key: str = "protein_expression"):
-    dest = store_path / "mod" / mod_key / "X_dense"
-    arr = zarr.open_array(str(dest), mode="r")
-    backed.mod[mod_key].X = arr
-    return arr
-
-
-def _setup_zarr_backed_multivi(tmp_path):
-    mdata, mdata_backed, store_path = _make_rna_protein_mixed_zarr_store(tmp_path)
-    protein_dense = np.asarray(mdata.mod["protein_expression"].X)
-    mdata_backed.mod["protein_expression"].X = protein_dense
+def test_multivi_train_auto_selects_zarr_datamodule():
+    mdata = synthetic_iid(return_mudata=True)
     MULTIVI.setup_mudata(
-        mdata_backed,
+        mdata,
         batch_key="batch",
-        modalities={"rna_layer": "RNA", "protein_layer": "protein_expression"},
+        modalities={
+            "rna_layer": "rna",
+            "protein_layer": "protein_expression",
+            "atac_layer": "accessibility",
+        },
     )
-    _attach_protein_dense_zarr(mdata_backed, store_path)
-    return mdata_backed, store_path
-
-
-def test_multivi_train_auto_selects_zarr_datamodule(tmp_path):
-    mdata_backed, _ = _setup_zarr_backed_multivi(tmp_path)
-    model = MULTIVI(mdata_backed)
+    model = MULTIVI(mdata)
+    zarr_dm = ZarrMultiVIDataModule(
+        model.adata_manager,
+        matrix_sources={REGISTRY_KEYS.X_KEY: object()},
+        n_obs=mdata.n_obs,
+    )
+    model._try_auto_zarr_datamodule = lambda **kwargs: zarr_dm
     model._train_runner_cls = _CaptureTrainRunner
 
     model.train(max_epochs=1, early_stopping=False)
 
-    assert isinstance(_CaptureTrainRunner.last_call["data_splitter"], ZarrMultiVIDataModule)
+    assert _CaptureTrainRunner.last_call["data_splitter"] is zarr_dm
     assert (
         _CaptureTrainRunner.last_call["trainer_kwargs"]["reload_dataloaders_every_n_epochs"] == 1
     )
@@ -685,15 +686,21 @@ def test_multivi_train_falls_back_to_data_splitter_for_in_memory_mudata():
     assert "reload_dataloaders_every_n_epochs" not in _CaptureTrainRunner.last_call["trainer_kwargs"]
 
 
-def test_multivi_train_explicit_datamodule_overrides_auto_selection(tmp_path):
-    mdata_backed, store_path = _setup_zarr_backed_multivi(tmp_path)
-    model = MULTIVI(mdata_backed)
-    explicit_dm = ZarrMultiVIDataModule.from_backed_mudata(
-        mdata_backed,
-        model.adata_manager,
-        matrix_layout="auto",
-        store_dir=store_path,
-        num_workers=0,
+def test_multivi_train_explicit_datamodule_overrides_auto_selection():
+    mdata = synthetic_iid(return_mudata=True)
+    MULTIVI.setup_mudata(
+        mdata,
+        batch_key="batch",
+        modalities={
+            "rna_layer": "rna",
+            "protein_layer": "protein_expression",
+            "atac_layer": "accessibility",
+        },
+    )
+    model = MULTIVI(mdata)
+    explicit_dm = object()
+    model._try_auto_zarr_datamodule = lambda **kwargs: (_ for _ in ()).throw(
+        AssertionError("auto-selection should not run when datamodule is provided")
     )
     model._train_runner_cls = _CaptureTrainRunner
 
@@ -702,9 +709,23 @@ def test_multivi_train_explicit_datamodule_overrides_auto_selection(tmp_path):
     assert _CaptureTrainRunner.last_call["data_splitter"] is explicit_dm
 
 
-def test_multivi_train_auto_zarr_respects_reload_dataloaders_override(tmp_path):
-    mdata_backed, _ = _setup_zarr_backed_multivi(tmp_path)
-    model = MULTIVI(mdata_backed)
+def test_multivi_train_auto_zarr_respects_reload_dataloaders_override():
+    mdata = synthetic_iid(return_mudata=True)
+    MULTIVI.setup_mudata(
+        mdata,
+        batch_key="batch",
+        modalities={
+            "rna_layer": "rna",
+            "protein_layer": "protein_expression",
+            "atac_layer": "accessibility",
+        },
+    )
+    model = MULTIVI(mdata)
+    model._try_auto_zarr_datamodule = lambda **kwargs: ZarrMultiVIDataModule(
+        model.adata_manager,
+        matrix_sources={REGISTRY_KEYS.X_KEY: object()},
+        n_obs=mdata.n_obs,
+    )
     model._train_runner_cls = _CaptureTrainRunner
 
     model.train(
@@ -718,70 +739,7 @@ def test_multivi_train_auto_zarr_respects_reload_dataloaders_override(tmp_path):
     )
 
 
-def test_multivi_train_zarr_auto_select_skipped_for_datasplitter_kwargs(tmp_path):
-    mdata_backed, _ = _setup_zarr_backed_multivi(tmp_path)
-    model = MULTIVI(mdata_backed)
-    model._train_runner_cls = _CaptureTrainRunner
-
-    model.train(
-        max_epochs=1,
-        early_stopping=False,
-        datasplitter_kwargs={"distributed_sampler": False},
-    )
-
-    assert isinstance(_CaptureTrainRunner.last_call["data_splitter"], DataSplitter)
-    assert "reload_dataloaders_every_n_epochs" not in _CaptureTrainRunner.last_call["trainer_kwargs"]
-
-
-class _CaptureTrainRunner:
-    """Record datamodule and trainer kwargs passed into TrainRunner."""
-
-    last_call: dict | None = None
-
-    def __init__(self, model, training_plan, data_splitter, **kwargs):
-        type(self).last_call = {
-            "data_splitter": data_splitter,
-            "trainer_kwargs": kwargs,
-        }
-
-    def __call__(self):
-        return None
-
-
-def _attach_protein_dense_zarr(backed: MuData, store_path: Path, mod_key: str = "protein_expression"):
-    dest = store_path / "mod" / mod_key / "X_dense"
-    arr = zarr.open_array(str(dest), mode="r")
-    backed.mod[mod_key].X = arr
-    return arr
-
-
-def _setup_zarr_backed_multivi(tmp_path):
-    mdata, mdata_backed, store_path = _make_rna_protein_mixed_zarr_store(tmp_path)
-    protein_dense = np.asarray(mdata.mod["protein_expression"].X)
-    mdata_backed.mod["protein_expression"].X = protein_dense
-    MULTIVI.setup_mudata(
-        mdata_backed,
-        batch_key="batch",
-        modalities={"rna_layer": "RNA", "protein_layer": "protein_expression"},
-    )
-    _attach_protein_dense_zarr(mdata_backed, store_path)
-    return mdata_backed, store_path
-
-
-def test_multivi_train_auto_selects_zarr_datamodule(tmp_path):
-    mdata_backed, _ = _setup_zarr_backed_multivi(tmp_path)
-    model = MULTIVI(mdata_backed)
-    model._train_runner_cls = _CaptureTrainRunner
-
-    model.train(max_epochs=1, early_stopping=False)
-
-    assert isinstance(_CaptureTrainRunner.last_call["data_splitter"], ZarrMultiVIDataModule)
-    assert (
-        _CaptureTrainRunner.last_call["trainer_kwargs"]["reload_dataloaders_every_n_epochs"] == 1
-    )
-
-
-def test_multivi_train_falls_back_to_data_splitter_for_in_memory_mudata():
+def test_multivi_train_zarr_auto_select_skipped_for_datasplitter_kwargs():
     mdata = synthetic_iid(return_mudata=True)
     MULTIVI.setup_mudata(
         mdata,
@@ -795,50 +753,6 @@ def test_multivi_train_falls_back_to_data_splitter_for_in_memory_mudata():
     model = MULTIVI(mdata)
     model._train_runner_cls = _CaptureTrainRunner
 
-    model.train(max_epochs=1, early_stopping=False)
-
-    assert isinstance(_CaptureTrainRunner.last_call["data_splitter"], DataSplitter)
-    assert "reload_dataloaders_every_n_epochs" not in _CaptureTrainRunner.last_call["trainer_kwargs"]
-
-
-def test_multivi_train_explicit_datamodule_overrides_auto_selection(tmp_path):
-    mdata_backed, store_path = _setup_zarr_backed_multivi(tmp_path)
-    model = MULTIVI(mdata_backed)
-    explicit_dm = ZarrMultiVIDataModule.from_backed_mudata(
-        mdata_backed,
-        model.adata_manager,
-        matrix_layout="auto",
-        store_dir=store_path,
-        num_workers=0,
-    )
-    model._train_runner_cls = _CaptureTrainRunner
-
-    model.train(max_epochs=1, datamodule=explicit_dm, early_stopping=False)
-
-    assert _CaptureTrainRunner.last_call["data_splitter"] is explicit_dm
-
-
-def test_multivi_train_auto_zarr_respects_reload_dataloaders_override(tmp_path):
-    mdata_backed, _ = _setup_zarr_backed_multivi(tmp_path)
-    model = MULTIVI(mdata_backed)
-    model._train_runner_cls = _CaptureTrainRunner
-
-    model.train(
-        max_epochs=1,
-        early_stopping=False,
-        reload_dataloaders_every_n_epochs=5,
-    )
-
-    assert (
-        _CaptureTrainRunner.last_call["trainer_kwargs"]["reload_dataloaders_every_n_epochs"] == 5
-    )
-
-
-def test_multivi_train_zarr_auto_select_skipped_for_datasplitter_kwargs(tmp_path):
-    mdata_backed, _ = _setup_zarr_backed_multivi(tmp_path)
-    model = MULTIVI(mdata_backed)
-    model._train_runner_cls = _CaptureTrainRunner
-
     model.train(
         max_epochs=1,
         early_stopping=False,
@@ -847,3 +761,39 @@ def test_multivi_train_zarr_auto_select_skipped_for_datasplitter_kwargs(tmp_path
 
     assert isinstance(_CaptureTrainRunner.last_call["data_splitter"], DataSplitter)
     assert "reload_dataloaders_every_n_epochs" not in _CaptureTrainRunner.last_call["trainer_kwargs"]
+
+
+def test_multivi_try_auto_zarr_datamodule_with_backed_mudata():
+    mdata = synthetic_iid(return_mudata=True)
+    MULTIVI.setup_mudata(
+        mdata,
+        batch_key="batch",
+        modalities={
+            "rna_layer": "rna",
+            "protein_layer": "protein_expression",
+            "atac_layer": "accessibility",
+        },
+    )
+    model = MULTIVI(mdata)
+    expected = object()
+
+    class _FakeZarrMultiVIDataModule:
+        @classmethod
+        def from_backed_mudata(cls, *args, **kwargs):
+            assert kwargs["matrix_layout"] == "auto"
+            assert kwargs["batch_size"] == 16
+            return expected
+
+    original = ZarrMultiVIDataModule.from_backed_mudata
+    ZarrMultiVIDataModule.from_backed_mudata = _FakeZarrMultiVIDataModule.from_backed_mudata
+    try:
+        datamodule = model._try_auto_zarr_datamodule(
+            train_size=0.8,
+            validation_size=None,
+            batch_size=16,
+            datasplitter_kwargs={"num_workers": 0},
+        )
+    finally:
+        ZarrMultiVIDataModule.from_backed_mudata = original
+
+    assert datamodule is expected

@@ -14,6 +14,7 @@ from ._zarr_dataset import (
     csr_sources_from_backed_mudata,
     matrix_sources_from_backed_mudata,
 )
+from ._cuda_prefetch import CUDABatchPrefetcher
 from ._data_splitting import (
     DataSplitter,
     DeviceBackedDataSplitter,
@@ -32,6 +33,7 @@ __all__ = [
     "DataSplitter",
     "SemiSupervisedDataSplitter",
     "BatchDistributedSampler",
+    "CUDABatchPrefetcher",
     "MappedCollectionDataModule",
     "TileDBDataModule",
     "ZarrCSRSource",

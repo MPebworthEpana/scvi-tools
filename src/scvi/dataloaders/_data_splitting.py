@@ -16,6 +16,7 @@ from scvi import REGISTRY_KEYS, settings
 from scvi.data import AnnDataManager
 from scvi.data._utils import get_anndata_attribute
 from scvi.dataloaders._ann_dataloader import AnnDataLoader
+from scvi.dataloaders._cuda_prefetch import maybe_wrap_cuda_prefetch
 from scvi.dataloaders._semi_dataloader import SemiSupervisedDataLoader
 from scvi.model._utils import parse_device_args
 from scvi.utils._docstrings import devices_dsp
@@ -204,6 +205,11 @@ class DataSplitter(pl.LightningDataModule):
     pin_memory
         Whether to copy tensors into device-pinned memory before returning them. Passed
         into :class:`~scvi.dataloaders.AnnDataLoader`.
+    prefetch_to_gpu
+        If ``True``, overlap host-to-device transfer with training using a side CUDA stream.
+        Requires ``pin_memory=True`` and ``load_sparse_tensor=False``.
+    cuda_queue_depth
+        Number of GPU batches to keep in flight when ``prefetch_to_gpu=True``. Default is 2.
     external_indexing
         A list of data split indices in the order of training, validation, and test sets.
         Validation and test set are not required and can be left empty.
@@ -232,6 +238,8 @@ class DataSplitter(pl.LightningDataModule):
         shuffle_set_split: bool = True,
         load_sparse_tensor: bool = False,
         pin_memory: bool = False,
+        prefetch_to_gpu: bool = False,
+        cuda_queue_depth: int = 2,
         external_indexing: list[np.array, np.array, np.array] | None = None,
         **kwargs,
     ):
@@ -245,6 +253,8 @@ class DataSplitter(pl.LightningDataModule):
         self.drop_last = kwargs.pop("drop_last", False)
         self.data_loader_kwargs = kwargs
         self.pin_memory = pin_memory
+        self.prefetch_to_gpu = prefetch_to_gpu
+        self.cuda_queue_depth = cuda_queue_depth
         self.external_indexing = external_indexing
 
         if self.external_indexing is not None:
@@ -286,9 +296,18 @@ class DataSplitter(pl.LightningDataModule):
             self.train_idx = indices[n_val : (n_val + n_train)]
             self.test_idx = indices[(n_val + n_train) :]
 
+    def _maybe_wrap_cuda_prefetch(self, loader: DataLoader) -> DataLoader:
+        return maybe_wrap_cuda_prefetch(
+            loader,
+            prefetch_to_gpu=self.prefetch_to_gpu,
+            cuda_queue_depth=self.cuda_queue_depth,
+            pin_memory=self.pin_memory,
+            load_sparse_tensor=self.load_sparse_tensor,
+        )
+
     def train_dataloader(self):
         """Create a train data loader."""
-        return self.data_loader_cls(
+        loader = self.data_loader_cls(
             self.adata_manager,
             indices=self.train_idx,
             shuffle=True,
@@ -297,11 +316,12 @@ class DataSplitter(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             **self.data_loader_kwargs,
         )
+        return self._maybe_wrap_cuda_prefetch(loader)
 
     def val_dataloader(self):
         """Create validation data loader."""
         if len(self.val_idx) > 0:
-            return self.data_loader_cls(
+            loader = self.data_loader_cls(
                 self.adata_manager,
                 indices=self.val_idx,
                 shuffle=False,
@@ -310,13 +330,14 @@ class DataSplitter(pl.LightningDataModule):
                 pin_memory=self.pin_memory,
                 **self.data_loader_kwargs,
             )
+            return self._maybe_wrap_cuda_prefetch(loader)
         else:
             pass
 
     def test_dataloader(self):
         """Create a test data loader."""
         if len(self.test_idx) > 0:
-            return self.data_loader_cls(
+            loader = self.data_loader_cls(
                 self.adata_manager,
                 indices=self.test_idx,
                 shuffle=False,
@@ -325,6 +346,7 @@ class DataSplitter(pl.LightningDataModule):
                 pin_memory=self.pin_memory,
                 **self.data_loader_kwargs,
             )
+            return self._maybe_wrap_cuda_prefetch(loader)
         else:
             pass
 
@@ -364,6 +386,11 @@ class SemiSupervisedDataSplitter(pl.LightningDataModule):
     pin_memory
         Whether to copy tensors into device-pinned memory before returning them. Passed
         into :class:`~scvi.dataloaders.AnnDataLoader`.
+    prefetch_to_gpu
+        If ``True``, overlap host-to-device transfer with training using a side CUDA stream.
+        Requires ``pin_memory=True``.
+    cuda_queue_depth
+        Number of GPU batches to keep in flight when ``prefetch_to_gpu=True``. Default is 2.
     external_indexing
         A list of data split indices in the order of training, validation, and test sets.
         Validation and test set are not required and can be left empty.
@@ -393,6 +420,8 @@ class SemiSupervisedDataSplitter(pl.LightningDataModule):
         shuffle_set_split: bool = True,
         n_samples_per_label: int | None = None,
         pin_memory: bool = False,
+        prefetch_to_gpu: bool = False,
+        cuda_queue_depth: int = 2,
         external_indexing: list[np.array, np.array, np.array] | None = None,
         **kwargs,
     ):
@@ -405,6 +434,8 @@ class SemiSupervisedDataSplitter(pl.LightningDataModule):
         self.drop_last = kwargs.pop("drop_last", False)
         self.data_loader_kwargs = kwargs
         self.n_samples_per_label = n_samples_per_label
+        self.prefetch_to_gpu = prefetch_to_gpu
+        self.cuda_queue_depth = cuda_queue_depth
 
         labels_state_registry = adata_manager.get_state_registry(REGISTRY_KEYS.LABELS_KEY)
         labels = get_anndata_attribute(
@@ -545,9 +576,18 @@ class SemiSupervisedDataSplitter(pl.LightningDataModule):
 
         self.data_loader_kwargs.update(dl_kwargs)
 
+    def _maybe_wrap_cuda_prefetch(self, loader: DataLoader) -> DataLoader:
+        return maybe_wrap_cuda_prefetch(
+            loader,
+            prefetch_to_gpu=self.prefetch_to_gpu,
+            cuda_queue_depth=self.cuda_queue_depth,
+            pin_memory=self.pin_memory,
+            load_sparse_tensor=False,
+        )
+
     def train_dataloader(self):
         """Create the train data loader."""
-        return self.data_loader_class(
+        loader = self.data_loader_class(
             self.adata_manager,
             indices=self.train_idx,
             shuffle=True,
@@ -555,11 +595,12 @@ class SemiSupervisedDataSplitter(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             **self.data_loader_kwargs,
         )
+        return self._maybe_wrap_cuda_prefetch(loader)
 
     def val_dataloader(self):
         """Create the validation data loader."""
         if len(self.val_idx) > 0:
-            return self.data_loader_class(
+            loader = self.data_loader_class(
                 self.adata_manager,
                 indices=self.val_idx,
                 shuffle=False,
@@ -567,13 +608,14 @@ class SemiSupervisedDataSplitter(pl.LightningDataModule):
                 pin_memory=self.pin_memory,
                 **self.data_loader_kwargs,
             )
+            return self._maybe_wrap_cuda_prefetch(loader)
         else:
             pass
 
     def test_dataloader(self):
         """Create the test data loader."""
         if len(self.test_idx) > 0:
-            return self.data_loader_class(
+            loader = self.data_loader_class(
                 self.adata_manager,
                 indices=self.test_idx,
                 shuffle=False,
@@ -581,6 +623,7 @@ class SemiSupervisedDataSplitter(pl.LightningDataModule):
                 pin_memory=self.pin_memory,
                 **self.data_loader_kwargs,
             )
+            return self._maybe_wrap_cuda_prefetch(loader)
         else:
             pass
 

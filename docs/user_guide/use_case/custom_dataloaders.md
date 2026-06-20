@@ -140,6 +140,12 @@ This API is intended for training models on a set of AnnData files. AnnCollectio
 This wrapper mimics the standard API; so in practice, users wrap their collection objects then proceed with the scvi-tools workflow as normal and not using the custom dataloader workflow.
 Note that to use it, count data should be in sparse form (sparse.csr_matrix).
 
+4. **Zarr-backed MultiVI streaming** — {class}`scvi.dataloaders.ZarrMultiVIDataModule` streams
+   paired modality batches from zarr-backed {class}`~mudata.MuData` stores into
+   {class}`~scvi.model.MULTIVI`, including mixed sparse RNA (CSR) and dense ADT/protein layouts.
+   See {doc}`zarr_multivi_streaming` for setup, `matrix_layout="auto"` requirements, and tuning
+   (`block_size`, `shuffle_buffer_blocks`, `num_workers`, `pin_memory`).
+
 Key Differences between Lamin and TileDb in terms of Custom Dataloaders:
 1. Data Format:
 
@@ -166,5 +172,7 @@ It will also requite maintenance: If the data format or preprocessing needs chan
 See relevant tutorials on this subject for further examples.
 
 :::{note}
-As for SCVI-Tools v1.3.0 Custom Dataloaders are experimental and only supported for SCVI and SCANVI models (although extension should be straightforward)
+Custom dataloaders are experimental. SCVI and SCANVI support TileDB and LamindDB-style loaders;
+MultiVI additionally supports zarr-backed streaming via {class}`~scvi.dataloaders.ZarrMultiVIDataModule`
+(see {doc}`zarr_multivi_streaming`).
 :::

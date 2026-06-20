@@ -11,10 +11,12 @@ import pyro
 import torch
 import torchmetrics.functional as tmf
 from lightning.pytorch.strategies.ddp import DDPStrategy
+from lightning.pytorch.utilities import move_data_to_device
 from pyro.nn import PyroModule
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from scvi import REGISTRY_KEYS, settings
+from scvi.dataloaders._cuda_prefetch import batch_tensors_on_device
 from scvi.module import Classifier
 from scvi.module.base import (
     BaseModuleClass,
@@ -253,6 +255,13 @@ class TrainingPlan(pl.LightningModule):
             self.val_metrics,
         ) = self._create_elbo_metric_components(mode="validation", n_total=self.n_obs_validation)
         self.elbo_val.reset()
+
+    @staticmethod
+    def transfer_batch_to_device(batch, device, dataloader_idx):
+        """Skip redundant H2D when batches are already on the target device."""
+        if batch_tensors_on_device(batch, device):
+            return batch
+        return move_data_to_device(batch, device)
 
     @property
     def use_sync_dist(self):

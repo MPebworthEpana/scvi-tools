@@ -12,4 +12,5 @@ saving_and_loading_models
 scvi_criticism
 training_configuration
 using_callbacks
+zarr_multivi_streaming
 ```
