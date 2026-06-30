@@ -15,14 +15,43 @@ from torch.utils.data import DataLoader
 
 from scvi import REGISTRY_KEYS
 from scvi.dataloaders import (
+    ZarrAnnDataModule,
     ZarrDataset,
     ZarrMultiVIDataModule,
     csr_sources_from_backed_mudata,
+    matrix_sources_from_backed_anndata,
     matrix_sources_from_backed_mudata,
 )
 from scvi.dataloaders._zarr_dataset import _identity_collate
 from scvi.data import synthetic_iid
-from scvi.model import MULTIVI
+from scvi.model import MULTIVI, PEAKVI, SCVI
+
+
+def _write_and_open_backed_anndata(adata, store_path: Path):
+    """Test helper: write AnnData to zarr and reopen with zarr-backed CSRDataset on .X."""
+    import anndata
+
+    previous = anndata.settings.allow_write_nullable_strings
+    anndata.settings.allow_write_nullable_strings = True
+    try:
+        adata.write_zarr(store_path)
+    finally:
+        anndata.settings.allow_write_nullable_strings = previous
+    backed = anndata.read_zarr(store_path)
+    f = zarr.open(str(store_path), mode="r")
+    x_group = f["X"]
+    enc = x_group.attrs.get("encoding-type", "")
+    if enc in ("csr_matrix", "csc_matrix"):
+        backed.X = sparse_dataset(x_group)
+    return backed
+
+
+def _make_synthetic_anndata_zarr_store(tmp_path, *, batch_size: int = 32, n_genes: int = 20):
+    adata = synthetic_iid(batch_size=batch_size, n_genes=n_genes, n_batches=2)
+    adata.X = sp.random(adata.n_obs, n_genes, density=0.2, format="csr", dtype=np.float32)
+    store_path = tmp_path / "adata.zarr"
+    adata_backed = _write_and_open_backed_anndata(adata, store_path)
+    return adata, adata_backed
 
 
 def _write_and_open_backed_mudata(mdata: MuData, store_path: Path) -> MuData:
@@ -340,7 +369,7 @@ def test_zarr_datamodule_epoch_reshuffle(zarr_store):
     assert epoch0_a != epoch1
 
 
-def test_zarr_datamodule_rejects_covariates(zarr_store):
+def test_zarr_datamodule_supports_covariates(zarr_store):
     _, mdata_backed = zarr_store
     mdata_backed.obs["extra_cat"] = np.random.randint(0, 3, size=mdata_backed.n_obs)
     MULTIVI.setup_mudata(
@@ -350,12 +379,15 @@ def test_zarr_datamodule_rejects_covariates(zarr_store):
         modalities={"rna_layer": "RNA", "atac_layer": "ATAC"},
     )
     model = MULTIVI(mdata_backed)
-    with pytest.raises(NotImplementedError, match="covariates"):
-        ZarrMultiVIDataModule.from_backed_mudata(
-            mdata_backed,
-            model.adata_manager,
-            num_workers=0,
-        )
+    dm = ZarrMultiVIDataModule.from_backed_mudata(
+        mdata_backed,
+        model.adata_manager,
+        num_workers=0,
+    )
+    assert REGISTRY_KEYS.CAT_COVS_KEY in dm.obs_tensors
+    loader = dm.train_dataloader()
+    batch = next(iter(loader))
+    assert batch[REGISTRY_KEYS.CAT_COVS_KEY].ndim == 2
 
 
 def _collect_indices_from_loader(loader) -> set[int]:
@@ -1221,6 +1253,99 @@ def test_multivi_dense_zarr_datamodule_smoke(dense_zarr_store, num_workers):
         seed=0,
         matrix_layout="dense",
         store_dir=store_path,
+    )
+    model.train(
+        max_epochs=1,
+        datamodule=dm,
+        early_stopping=False,
+        check_val_every_n_epoch=1,
+    )
+
+
+@pytest.fixture
+def anndata_zarr_store(tmp_path):
+    return _make_synthetic_anndata_zarr_store(tmp_path)
+
+
+def test_matrix_sources_from_backed_anndata(anndata_zarr_store):
+    _, adata_backed = anndata_zarr_store
+    SCVI.setup_anndata(adata_backed, batch_key="batch")
+    model = SCVI(adata_backed)
+    sources = matrix_sources_from_backed_anndata(adata_backed, model.adata_manager)
+    assert set(sources) == {REGISTRY_KEYS.X_KEY}
+    assert sources[REGISTRY_KEYS.X_KEY].layout == "csr"
+    assert Path(sources[REGISTRY_KEYS.X_KEY].x_relpath).is_absolute()
+
+
+def test_zarr_ann_datamodule_smoke(anndata_zarr_store):
+    _, adata_backed = anndata_zarr_store
+    SCVI.setup_anndata(adata_backed, batch_key="batch")
+    model = SCVI(adata_backed)
+    dm = ZarrAnnDataModule.from_backed_anndata(
+        adata_backed,
+        model.adata_manager,
+        matrix_layout="auto",
+        num_workers=0,
+        batch_size=16,
+    )
+    loader = dm.train_dataloader()
+    batch = next(iter(loader))
+    assert batch[REGISTRY_KEYS.X_KEY].shape[0] == 16
+    assert batch[REGISTRY_KEYS.BATCH_KEY].shape[0] == 16
+
+
+def test_zarr_ann_datamodule_with_covariates(anndata_zarr_store):
+    _, adata_backed = anndata_zarr_store
+    adata_backed.obs["extra_cat"] = np.random.randint(0, 3, size=adata_backed.n_obs)
+    adata_backed.obs["extra_cont"] = np.random.randn(adata_backed.n_obs)
+    SCVI.setup_anndata(
+        adata_backed,
+        batch_key="batch",
+        categorical_covariate_keys=["extra_cat"],
+        continuous_covariate_keys=["extra_cont"],
+    )
+    model = SCVI(adata_backed)
+    dm = ZarrAnnDataModule.from_backed_anndata(
+        adata_backed,
+        model.adata_manager,
+        matrix_layout="auto",
+        num_workers=0,
+        batch_size=16,
+    )
+    batch = next(iter(dm.train_dataloader()))
+    assert batch[REGISTRY_KEYS.CAT_COVS_KEY].shape[0] == 16
+    assert batch[REGISTRY_KEYS.CONT_COVS_KEY].shape[0] == 16
+
+
+def test_scvi_train_with_zarr_ann_datamodule(anndata_zarr_store):
+    _, adata_backed = anndata_zarr_store
+    SCVI.setup_anndata(adata_backed, batch_key="batch")
+    model = SCVI(adata_backed)
+    dm = ZarrAnnDataModule.from_backed_anndata(
+        adata_backed,
+        model.adata_manager,
+        matrix_layout="auto",
+        num_workers=0,
+        batch_size=16,
+    )
+    model.train(
+        max_epochs=1,
+        datamodule=dm,
+        early_stopping=False,
+        check_val_every_n_epoch=1,
+    )
+
+
+def test_peakvi_train_with_zarr_ann_datamodule(anndata_zarr_store):
+    _, adata_backed = anndata_zarr_store
+    PEAKVI.setup_anndata(adata_backed, batch_key="batch")
+    model = PEAKVI(adata_backed)
+    dm = ZarrAnnDataModule.from_backed_anndata(
+        adata_backed,
+        model.adata_manager,
+        matrix_layout="auto",
+        num_workers=0,
+        batch_size=16,
     )
     model.train(
         max_epochs=1,

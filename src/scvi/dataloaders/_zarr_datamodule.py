@@ -1,4 +1,4 @@
-"""Lightning DataModule for MultiVI streaming from zarr-backed CSR stores."""
+"""Lightning DataModules for zarr-backed streaming into scvi-tools models."""
 
 from __future__ import annotations
 
@@ -8,12 +8,13 @@ from typing import Literal
 
 import lightning.pytorch as pl
 import numpy as np
+from anndata import AnnData
 from mudata import MuData
 from torch.utils.data import DataLoader
 
 from scvi import REGISTRY_KEYS, settings
 from scvi.data._manager import AnnDataManager
-from scvi.data._utils import get_anndata_attribute
+from scvi.data._utils import get_anndata_attribute, registry_key_to_default_dtype
 from scvi.dataloaders._cuda_prefetch import maybe_wrap_cuda_prefetch
 from scvi.dataloaders._data_splitting import validate_data_split
 from scvi.dataloaders._zarr_dataset import (
@@ -22,29 +23,52 @@ from scvi.dataloaders._zarr_dataset import (
     ZarrMatrixSource,
     _identity_collate,
     csr_sources_from_backed_mudata,
+    matrix_sources_from_backed_anndata,
     matrix_sources_from_backed_mudata,
 )
 
 logger = logging.getLogger(__name__)
 
-_UNSUPPORTED_COVARIATE_MSG = (
-    "ZarrMultiVIDataModule does not yet support categorical or continuous "
-    "covariates. Pass models without covariate keys, or use the default "
-    "AnnData DataSplitter instead."
-)
-
 EmitMode = Literal["rolling", "flush"]
 
+DATASPLITTER_ONLY_KWARGS = frozenset({
+    "distributed_sampler",
+    "shuffle_set_split",
+    "load_sparse_tensor",
+    "external_indexing",
+})
 
-class ZarrMultiVIDataModule(pl.LightningDataModule):
-    """EXPERIMENTAL: Stream paired modality batches from zarr-backed CSR or dense stores into MultiVI.
+ZARR_DATAMODULE_KWARGS = frozenset({
+    "block_size",
+    "shuffle_buffer_blocks",
+    "emit_mode",
+    "prefetch_queue_depth",
+    "block_prefetch_depth",
+    "prefetch_factor",
+    "num_workers",
+    "pin_memory",
+    "prefetch_to_gpu",
+    "cuda_queue_depth",
+    "seed",
+    "drop_last",
+    "persistent_workers",
+})
 
-    Use :meth:`from_backed_mudata` to construct this datamodule. The caller must
-    supply a MuData whose modality matrices are zarr-backed (CSR ``CSRDataset`` or
-    dense ``zarr.Array``, e.g. from ``mudata.write_zarr`` with backed reopen).
-    Mixed per-modality layouts (e.g. RNA CSR + ADT dense) are supported when
-    ``matrix_layout='auto'``.
-    """
+_SCALAR_OBS_KEYS = frozenset({
+    REGISTRY_KEYS.BATCH_KEY,
+    REGISTRY_KEYS.LABELS_KEY,
+    REGISTRY_KEYS.INDICES_KEY,
+    REGISTRY_KEYS.SIZE_FACTOR_KEY,
+})
+
+_JOINT_OBS_KEYS = frozenset({
+    REGISTRY_KEYS.CAT_COVS_KEY,
+    REGISTRY_KEYS.CONT_COVS_KEY,
+})
+
+
+class _BaseZarrDataModule(pl.LightningDataModule):
+    """Shared zarr streaming datamodule logic for IterableDataset-backed training."""
 
     def __init__(
         self,
@@ -103,104 +127,34 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
         self._train_dataset: ZarrDataset | None = None
         self._val_dataset: ZarrDataset | None = None
 
-        self._reject_unsupported_covariates()
+        self._validate_obs_fields()
         self.obs_tensors = self._build_obs_tensors()
         self._split_indices()
 
-    @classmethod
-    def from_backed_mudata(
-        cls,
-        mdata: MuData,
-        adata_manager: AnnDataManager,
-        *,
-        registry_map: dict[str, str] | None = None,
-        matrix_layout: str = "csr",
-        x_suffix: str = "",
-        store_dir: Path | str | None = None,
-        **kwargs,
-    ) -> ZarrMultiVIDataModule:
-        """EXPERIMENTAL: Create a datamodule that streams from an already-backed MuData.
+    @property
+    def n_vars(self) -> int:
+        return int(self.adata_manager.summary_stats.n_vars)
 
-        Matrix paths are extracted once in the main process; workers reopen zarr
-        handles independently.
+    @property
+    def n_batch(self) -> int:
+        return int(self.adata_manager.summary_stats.n_batch)
 
-        Parameters
-        ----------
-        matrix_layout
-            ``'csr'`` forces CSR for all modalities, ``'dense'`` forces dense for all,
-            and ``'auto'`` infers layout per modality (supports mixed CSR + dense).
-        """
-        if registry_map is None:
-            registry_map = {}
-            for key in (
-                REGISTRY_KEYS.X_KEY,
-                REGISTRY_KEYS.ATAC_X_KEY,
-                REGISTRY_KEYS.PROTEIN_EXP_KEY,
-            ):
-                if key not in adata_manager.data_registry:
-                    continue
-                data_loc = adata_manager.data_registry[key]
-                mod_key = getattr(data_loc, "mod_key", None)
-                if mod_key is None:
-                    raise ValueError(
-                        f"Registry key {key!r} has no mod_key; pass registry_map explicitly."
-                    )
-                registry_map[key] = mod_key
-            if not registry_map:
-                raise ValueError(
-                    "Could not infer registry_map from adata_manager. "
-                    "Pass registry_map={REGISTRY_KEYS.X_KEY: 'RNA', ...} explicitly."
-                )
+    @property
+    def n_labels(self) -> int:
+        return int(self.adata_manager.summary_stats.n_labels)
 
-        if matrix_layout == "dense":
-            layout: str = "dense"
-        elif matrix_layout == "auto":
-            layout = "auto"
-        else:
-            layout = "csr"
+    @property
+    def n_continuous_cov(self) -> int:
+        return int(self.adata_manager.summary_stats.get("n_extra_continuous_covs", 0))
 
-        if store_dir is None and layout in ("dense", "auto"):
-            candidate = getattr(mdata, "filename", None)
-            if isinstance(candidate, (str, Path)):
-                store_dir = candidate
+    @property
+    def n_cats_per_cov(self) -> tuple[int, ...] | None:
+        if REGISTRY_KEYS.CAT_COVS_KEY not in self.adata_manager.data_registry:
+            return None
+        return self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY).n_cats_per_key
 
-        source_kwargs: dict = {
-            "n_obs": mdata.n_obs,
-            "layout": layout,
-        }
-        if layout == "dense":
-            if not x_suffix:
-                x_suffix = "_dense"
-            source_kwargs["x_suffix"] = x_suffix
-            if store_dir is None:
-                raise ValueError(
-                    "store_dir is required for dense matrix_layout (path to the zarr store)."
-                )
-            source_kwargs["store_dir"] = store_dir
-        elif layout == "auto":
-            if x_suffix:
-                if store_dir is None:
-                    raise ValueError(
-                        "store_dir is required when using x_suffix with matrix_layout='auto'."
-                    )
-                source_kwargs["x_suffix"] = x_suffix
-            if store_dir is not None:
-                source_kwargs["store_dir"] = store_dir
-
-        sources = matrix_sources_from_backed_mudata(mdata, registry_map, **source_kwargs)
-        resolved_store_dir = Path(store_dir) if store_dir is not None else None
-        return cls(
-            adata_manager,
-            matrix_sources=sources,
-            n_obs=mdata.n_obs,
-            store_dir=resolved_store_dir,
-            **kwargs,
-        )
-
-    def _reject_unsupported_covariates(self) -> None:
+    def _validate_obs_fields(self) -> None:
         registry = self.adata_manager.data_registry
-        if REGISTRY_KEYS.CAT_COVS_KEY in registry or REGISTRY_KEYS.CONT_COVS_KEY in registry:
-            raise NotImplementedError(_UNSUPPORTED_COVARIATE_MSG)
         if REGISTRY_KEYS.SIZE_FACTOR_KEY in registry:
             data_loc = registry[REGISTRY_KEYS.SIZE_FACTOR_KEY]
             values = get_anndata_attribute(
@@ -212,10 +166,10 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
             arr = np.asarray(values)
             if arr.ndim > 1 and arr.shape[1] > 1:
                 raise NotImplementedError(
-                    "ZarrMultiVIDataModule does not yet support multi-column size factors."
+                    "Zarr datamodules do not yet support multi-column size factors."
                 )
 
-    def _registry_array(self, registry_key: str, *, dtype) -> np.ndarray:
+    def _registry_obs_array(self, registry_key: str) -> np.ndarray:
         data_loc = self.adata_manager.data_registry[registry_key]
         mod_key = getattr(data_loc, "mod_key", None)
         values = get_anndata_attribute(
@@ -224,12 +178,35 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
             data_loc.attr_key,
             mod_key=mod_key,
         )
+        dtype = registry_key_to_default_dtype(registry_key)
         arr = np.asarray(values, dtype=dtype)
+
+        if registry_key in _SCALAR_OBS_KEYS:
+            if arr.ndim == 2 and arr.shape[1] == 1:
+                arr = arr.reshape(-1)
+            if arr.ndim != 1:
+                raise NotImplementedError(
+                    f"Registry key {registry_key!r} must be 1-D per observation; "
+                    f"got shape {arr.shape}."
+                )
+            return arr
+
+        if registry_key in _JOINT_OBS_KEYS:
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            if arr.ndim != 2:
+                raise NotImplementedError(
+                    f"Registry key {registry_key!r} must be 2-D per observation; "
+                    f"got shape {arr.shape}."
+                )
+            return arr
+
         if arr.ndim == 2 and arr.shape[1] == 1:
             arr = arr.reshape(-1)
         if arr.ndim != 1:
             raise NotImplementedError(
-                f"Registry key {registry_key!r} must be 1-D per observation; got shape {arr.shape}."
+                f"Registry key {registry_key!r} must be 1-D or 2-D per observation; "
+                f"got shape {arr.shape}."
             )
         return arr
 
@@ -237,27 +214,29 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
         obs_tensors: dict[str, np.ndarray] = {}
 
         if REGISTRY_KEYS.INDICES_KEY in self.adata_manager.data_registry:
-            obs_tensors[REGISTRY_KEYS.INDICES_KEY] = self._registry_array(
-                REGISTRY_KEYS.INDICES_KEY, dtype=np.int64
+            obs_tensors[REGISTRY_KEYS.INDICES_KEY] = self._registry_obs_array(
+                REGISTRY_KEYS.INDICES_KEY
             )
         else:
             obs_tensors[REGISTRY_KEYS.INDICES_KEY] = np.arange(self.n_obs, dtype=np.int64)
 
-        obs_tensors[REGISTRY_KEYS.BATCH_KEY] = self._registry_array(
-            REGISTRY_KEYS.BATCH_KEY, dtype=np.int64
-        )
+        obs_tensors[REGISTRY_KEYS.BATCH_KEY] = self._registry_obs_array(REGISTRY_KEYS.BATCH_KEY)
 
         if REGISTRY_KEYS.LABELS_KEY in self.adata_manager.data_registry:
-            obs_tensors[REGISTRY_KEYS.LABELS_KEY] = self._registry_array(
-                REGISTRY_KEYS.LABELS_KEY, dtype=np.int64
+            obs_tensors[REGISTRY_KEYS.LABELS_KEY] = self._registry_obs_array(
+                REGISTRY_KEYS.LABELS_KEY
             )
         else:
             obs_tensors[REGISTRY_KEYS.LABELS_KEY] = np.zeros(self.n_obs, dtype=np.int64)
 
         if REGISTRY_KEYS.SIZE_FACTOR_KEY in self.adata_manager.data_registry:
-            obs_tensors[REGISTRY_KEYS.SIZE_FACTOR_KEY] = self._registry_array(
-                REGISTRY_KEYS.SIZE_FACTOR_KEY, dtype=np.float32
+            obs_tensors[REGISTRY_KEYS.SIZE_FACTOR_KEY] = self._registry_obs_array(
+                REGISTRY_KEYS.SIZE_FACTOR_KEY
             )
+
+        for key in (REGISTRY_KEYS.CAT_COVS_KEY, REGISTRY_KEYS.CONT_COVS_KEY):
+            if key in self.adata_manager.data_registry:
+                obs_tensors[key] = self._registry_obs_array(key)
 
         return obs_tensors
 
@@ -329,8 +308,6 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
     def train_dataloader(self) -> DataLoader:
         epoch = self._current_epoch()
         self._train_dataset = self._make_dataset(self.train_idx, shuffle=True, epoch=epoch)
-        # persistent_workers must be False so reload_dataloaders_every_n_epochs
-        # recreates loaders and picks up the new epoch for reshuffling.
         return self._make_dataloader(self._train_dataset, persistent_workers=False)
 
     def val_dataloader(self) -> DataLoader:
@@ -343,3 +320,215 @@ class ZarrMultiVIDataModule(pl.LightningDataModule):
             self._val_dataset,
             persistent_workers=self._val_persistent_workers,
         )
+
+
+class ZarrAnnDataModule(_BaseZarrDataModule):
+    """EXPERIMENTAL: Stream single-modality batches from zarr-backed AnnData into scVI or PeakVI.
+
+    Use :meth:`from_backed_anndata` to construct this datamodule. The caller must
+    supply an AnnData whose registered count matrix is zarr-backed (CSR ``CSRDataset``
+    or dense ``zarr.Array``, e.g. from ``adata.write_zarr`` with backed reopen).
+    """
+
+    @classmethod
+    def from_backed_anndata(
+        cls,
+        adata: AnnData,
+        adata_manager: AnnDataManager,
+        *,
+        registry_key: str = REGISTRY_KEYS.X_KEY,
+        matrix_layout: str = "csr",
+        x_suffix: str = "",
+        store_dir: Path | str | None = None,
+        **kwargs,
+    ) -> ZarrAnnDataModule:
+        """EXPERIMENTAL: Create a datamodule that streams from an already-backed AnnData."""
+        if matrix_layout == "dense":
+            layout: str = "dense"
+        elif matrix_layout == "auto":
+            layout = "auto"
+        else:
+            layout = "csr"
+
+        if store_dir is None and layout in ("dense", "auto"):
+            candidate = getattr(adata, "filename", None)
+            if isinstance(candidate, (str, Path)):
+                store_dir = candidate
+
+        source_kwargs: dict = {
+            "n_obs": adata.n_obs,
+            "layout": layout,
+            "registry_key": registry_key,
+        }
+        if layout == "dense":
+            if not x_suffix:
+                x_suffix = "_dense"
+            source_kwargs["x_suffix"] = x_suffix
+            if store_dir is None:
+                raise ValueError(
+                    "store_dir is required for dense matrix_layout (path to the zarr store)."
+                )
+            source_kwargs["store_dir"] = store_dir
+        elif layout == "auto":
+            if x_suffix:
+                if store_dir is None:
+                    raise ValueError(
+                        "store_dir is required when using x_suffix with matrix_layout='auto'."
+                    )
+                source_kwargs["x_suffix"] = x_suffix
+            if store_dir is not None:
+                source_kwargs["store_dir"] = store_dir
+
+        sources = matrix_sources_from_backed_anndata(adata, adata_manager, **source_kwargs)
+        resolved_store_dir = Path(store_dir) if store_dir is not None else None
+        return cls(
+            adata_manager,
+            matrix_sources=sources,
+            n_obs=adata.n_obs,
+            store_dir=resolved_store_dir,
+            **kwargs,
+        )
+
+
+class ZarrMultiVIDataModule(_BaseZarrDataModule):
+    """EXPERIMENTAL: Stream paired modality batches from zarr-backed CSR or dense stores into MultiVI.
+
+    Use :meth:`from_backed_mudata` to construct this datamodule. The caller must
+    supply a MuData whose modality matrices are zarr-backed (CSR ``CSRDataset`` or
+    dense ``zarr.Array``, e.g. from ``mudata.write_zarr`` with backed reopen).
+    Mixed per-modality layouts (e.g. RNA CSR + ADT dense) are supported when
+    ``matrix_layout='auto'``.
+    """
+
+    @classmethod
+    def from_backed_mudata(
+        cls,
+        mdata: MuData,
+        adata_manager: AnnDataManager,
+        *,
+        registry_map: dict[str, str] | None = None,
+        matrix_layout: str = "csr",
+        x_suffix: str = "",
+        store_dir: Path | str | None = None,
+        **kwargs,
+    ) -> ZarrMultiVIDataModule:
+        """EXPERIMENTAL: Create a datamodule that streams from an already-backed MuData."""
+        if registry_map is None:
+            registry_map = {}
+            for key in (
+                REGISTRY_KEYS.X_KEY,
+                REGISTRY_KEYS.ATAC_X_KEY,
+                REGISTRY_KEYS.PROTEIN_EXP_KEY,
+            ):
+                if key not in adata_manager.data_registry:
+                    continue
+                data_loc = adata_manager.data_registry[key]
+                mod_key = getattr(data_loc, "mod_key", None)
+                if mod_key is None:
+                    raise ValueError(
+                        f"Registry key {key!r} has no mod_key; pass registry_map explicitly."
+                    )
+                registry_map[key] = mod_key
+            if not registry_map:
+                raise ValueError(
+                    "Could not infer registry_map from adata_manager. "
+                    "Pass registry_map={REGISTRY_KEYS.X_KEY: 'RNA', ...} explicitly."
+                )
+
+        if matrix_layout == "dense":
+            layout: str = "dense"
+        elif matrix_layout == "auto":
+            layout = "auto"
+        else:
+            layout = "csr"
+
+        if store_dir is None and layout in ("dense", "auto"):
+            candidate = getattr(mdata, "filename", None)
+            if isinstance(candidate, (str, Path)):
+                store_dir = candidate
+
+        source_kwargs: dict = {
+            "n_obs": mdata.n_obs,
+            "layout": layout,
+        }
+        if layout == "dense":
+            if not x_suffix:
+                x_suffix = "_dense"
+            source_kwargs["x_suffix"] = x_suffix
+            if store_dir is None:
+                raise ValueError(
+                    "store_dir is required for dense matrix_layout (path to the zarr store)."
+                )
+            source_kwargs["store_dir"] = store_dir
+        elif layout == "auto":
+            if x_suffix:
+                if store_dir is None:
+                    raise ValueError(
+                        "store_dir is required when using x_suffix with matrix_layout='auto'."
+                    )
+                source_kwargs["x_suffix"] = x_suffix
+            if store_dir is not None:
+                source_kwargs["store_dir"] = store_dir
+
+        sources = matrix_sources_from_backed_mudata(mdata, registry_map, **source_kwargs)
+        resolved_store_dir = Path(store_dir) if store_dir is not None else None
+        return cls(
+            adata_manager,
+            matrix_sources=sources,
+            n_obs=mdata.n_obs,
+            store_dir=resolved_store_dir,
+            **kwargs,
+        )
+
+
+def try_auto_zarr_anndata_datamodule(
+    adata: AnnData,
+    adata_manager: AnnDataManager,
+    *,
+    train_size: float | None,
+    validation_size: float | None,
+    batch_size: int,
+    datasplitter_kwargs: dict | None,
+) -> ZarrAnnDataModule | None:
+    """Return a zarr streaming datamodule when ``adata`` has a zarr-backed count matrix."""
+    datasplitter_kwargs = datasplitter_kwargs or {}
+    splitter_only = DATASPLITTER_ONLY_KWARGS & datasplitter_kwargs.keys()
+    if splitter_only:
+        logger.debug(
+            "Skipping zarr datamodule auto-selection due to DataSplitter-only kwargs: %s",
+            sorted(splitter_only),
+        )
+        return None
+
+    unsupported = set(datasplitter_kwargs) - ZARR_DATAMODULE_KWARGS
+    if unsupported:
+        logger.debug(
+            "Skipping zarr datamodule auto-selection due to unsupported kwargs: %s",
+            sorted(unsupported),
+        )
+        return None
+
+    zarr_kwargs = {
+        key: datasplitter_kwargs[key]
+        for key in ZARR_DATAMODULE_KWARGS & datasplitter_kwargs.keys()
+    }
+    resolved_train_size = 0.9 if train_size is None else train_size
+
+    try:
+        datamodule = ZarrAnnDataModule.from_backed_anndata(
+            adata,
+            adata_manager,
+            matrix_layout="auto",
+            train_size=resolved_train_size,
+            validation_size=validation_size,
+            batch_size=batch_size,
+            **zarr_kwargs,
+        )
+    except Exception as exc:
+        logger.debug("Zarr datamodule auto-selection failed: %s", exc)
+        return None
+
+    logger.info(
+        "Detected zarr-backed count matrix; using ZarrAnnDataModule for training."
+    )
+    return datamodule

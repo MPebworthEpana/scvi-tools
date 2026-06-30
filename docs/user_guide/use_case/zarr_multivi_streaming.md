@@ -1,8 +1,10 @@
 # Zarr-backed MultiVI streaming
 
 :::{note}
-`ZarrDataset` and `ZarrMultiVIDataModule` are **EXPERIMENTAL** and currently supported for
+`ZarrDataset` and `ZarrMultiVIDataModule` are **EXPERIMENTAL** and supported for
 {class}`~scvi.model.MULTIVI` training on zarr-backed {class}`~mudata.MuData` objects.
+For single-modality {class}`~anndata.AnnData` streaming with scVI or PeakVI, see
+{doc}`zarr_anndata_streaming`.
 :::
 
 This page describes how to train MultiVI on large datasets stored on disk in zarr format without
@@ -247,9 +249,8 @@ comparison or `scripts/run_benchmark_wsl.sh` for the idle-gap benchmark.
 
 ## Limitations
 
-- Categorical and continuous covariates are **not** supported yet on `ZarrMultiVIDataModule`.
 - Multi-column size factors are not supported.
-- Experimental API; registry coverage is MultiVI-focused.
+- Experimental API; MultiVI uses `ZarrMultiVIDataModule`, scVI/PeakVI use `ZarrAnnDataModule`.
 - CSR modalities are converted to dense `float32` batches before the forward pass (dense ADT avoids
   CSR overhead for protein/ADT but still streams from disk).
 

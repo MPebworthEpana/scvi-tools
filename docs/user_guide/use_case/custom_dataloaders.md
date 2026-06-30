@@ -146,6 +146,10 @@ Note that to use it, count data should be in sparse form (sparse.csr_matrix).
    See {doc}`zarr_multivi_streaming` for setup, `matrix_layout="auto"` requirements, and tuning
    (`block_size`, `shuffle_buffer_blocks`, `num_workers`, `pin_memory`).
 
+5. **Zarr-backed scVI / PeakVI streaming** — {class}`scvi.dataloaders.ZarrAnnDataModule` streams
+   single-modality batches from zarr-backed {class}`~anndata.AnnData` into
+   {class}`~scvi.model.SCVI` or {class}`~scvi.model.PEAKVI`. See {doc}`zarr_anndata_streaming`.
+
 Key Differences between Lamin and TileDb in terms of Custom Dataloaders:
 1. Data Format:
 

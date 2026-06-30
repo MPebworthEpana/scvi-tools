@@ -12,6 +12,10 @@ import torch
 from scvi import REGISTRY_KEYS, settings
 from scvi.data._utils import _validate_adata_dataloader_input, get_anndata_attribute
 from scvi.dataloaders import DataSplitter, SemiSupervisedDataSplitter
+from scvi.dataloaders._zarr_datamodule import (
+    ZarrAnnDataModule,
+    try_auto_zarr_anndata_datamodule,
+)
 from scvi.model._utils import get_max_epochs_heuristic, use_distributed_sampler
 from scvi.train import (
     SemiSupervisedAdversarialTrainingPlan,
@@ -42,6 +46,31 @@ class UnsupervisedTrainingMixin:
     _data_splitter_cls = DataSplitter
     _training_plan_cls = TrainingPlan
     _train_runner_cls = TrainRunner
+    _supports_zarr_streaming: bool = False
+
+    def _try_auto_zarr_datamodule(
+        self,
+        *,
+        train_size: float | None,
+        validation_size: float | None,
+        batch_size: int,
+        datasplitter_kwargs: dict | None,
+    ):
+        """Return a zarr streaming datamodule when the input data is zarr-backed."""
+        if not self._supports_zarr_streaming:
+            return None
+        from anndata import AnnData
+
+        if not isinstance(self.adata, AnnData):
+            return None
+        return try_auto_zarr_anndata_datamodule(
+            self.adata,
+            self.adata_manager,
+            train_size=train_size,
+            validation_size=validation_size,
+            batch_size=batch_size,
+            datasplitter_kwargs=datasplitter_kwargs,
+        )
 
     @devices_dsp.dedent
     def train(
@@ -130,18 +159,32 @@ class UnsupervisedTrainingMixin:
                     "passed in."
                 )
 
+        user_provided_datamodule = datamodule is not None
+        auto_zarr_datamodule = False
         if datamodule is None:
             datasplitter_kwargs = datasplitter_kwargs or {}
-            datamodule = self._data_splitter_cls(
-                self.adata_manager,
+            resolved_batch_size = batch_size or settings.batch_size
+            datamodule = self._try_auto_zarr_datamodule(
                 train_size=train_size,
                 validation_size=validation_size,
-                batch_size=batch_size or settings.batch_size,
-                shuffle_set_split=shuffle_set_split,
-                distributed_sampler=use_distributed_sampler(trainer_kwargs.get("strategy", None)),
-                load_sparse_tensor=load_sparse_tensor,
-                **datasplitter_kwargs,
+                batch_size=resolved_batch_size,
+                datasplitter_kwargs=datasplitter_kwargs,
             )
+            if datamodule is not None:
+                auto_zarr_datamodule = True
+            else:
+                datamodule = self._data_splitter_cls(
+                    self.adata_manager,
+                    train_size=train_size,
+                    validation_size=validation_size,
+                    batch_size=resolved_batch_size,
+                    shuffle_set_split=shuffle_set_split,
+                    distributed_sampler=use_distributed_sampler(
+                        trainer_kwargs.get("strategy", None)
+                    ),
+                    load_sparse_tensor=load_sparse_tensor,
+                    **datasplitter_kwargs,
+                )
         elif self.module is None:
             self.module = self._module_cls(
                 datamodule.n_vars,
@@ -159,6 +202,13 @@ class UnsupervisedTrainingMixin:
         trainer_kwargs[es] = (
             early_stopping if es not in trainer_kwargs.keys() else trainer_kwargs[es]
         )
+        uses_zarr_datamodule = auto_zarr_datamodule or (
+            user_provided_datamodule
+            and datamodule is not None
+            and isinstance(datamodule, ZarrAnnDataModule)
+        )
+        if uses_zarr_datamodule and "reload_dataloaders_every_n_epochs" not in trainer_kwargs:
+            trainer_kwargs["reload_dataloaders_every_n_epochs"] = 1
         runner = self._train_runner_cls(
             self,
             training_plan=training_plan,

@@ -30,6 +30,7 @@ from scvi.model.base import (
     VAEMixin,
 )
 from scvi.dataloaders import ZarrMultiVIDataModule
+from scvi.dataloaders._zarr_datamodule import ZARR_DATAMODULE_KWARGS, DATASPLITTER_ONLY_KWARGS
 from scvi.model.base._de_core import _de_core
 from scvi.module import MULTIVAE
 from scvi.train import AdversarialTrainingPlan
@@ -49,27 +50,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DATASPLITTER_ONLY_KWARGS = frozenset({
-    "distributed_sampler",
-    "shuffle_set_split",
-    "load_sparse_tensor",
-    "external_indexing",
-})
-_ZARR_DATAMODULE_KWARGS = frozenset({
-    "block_size",
-    "shuffle_buffer_blocks",
-    "emit_mode",
-    "prefetch_queue_depth",
-    "block_prefetch_depth",
-    "prefetch_factor",
-    "num_workers",
-    "pin_memory",
-    "prefetch_to_gpu",
-    "cuda_queue_depth",
-    "seed",
-    "drop_last",
-    "persistent_workers",
-})
+_DATASPLITTER_ONLY_KWARGS = DATASPLITTER_ONLY_KWARGS
+_ZARR_DATAMODULE_KWARGS = ZARR_DATAMODULE_KWARGS
 
 
 class MULTIVI(

@@ -107,6 +107,7 @@ class SCVI(
     :class:`~scvi.module.VAE`
     """
 
+    _supports_zarr_streaming = True
     _module_cls = VAE
     _LATENT_QZM_KEY = "scvi_latent_qzm"
     _LATENT_QZV_KEY = "scvi_latent_qzv"

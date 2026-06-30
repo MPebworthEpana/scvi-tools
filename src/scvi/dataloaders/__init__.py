@@ -6,12 +6,18 @@ from ._ann_dataloader import AnnDataLoader
 from ._anncollection import CollectionAdapter
 from ._concat_dataloader import ConcatDataLoader
 from ._custom_dataloaders import MappedCollectionDataModule, TileDBDataModule
-from ._zarr_datamodule import ZarrMultiVIDataModule
+from ._zarr_datamodule import (
+    ZARR_DATAMODULE_KWARGS,
+    ZarrAnnDataModule,
+    ZarrMultiVIDataModule,
+    try_auto_zarr_anndata_datamodule,
+)
 from ._zarr_dataset import (
     ZarrCSRSource,
     ZarrDataset,
     ZarrMatrixSource,
     csr_sources_from_backed_mudata,
+    matrix_sources_from_backed_anndata,
     matrix_sources_from_backed_mudata,
 )
 from ._cuda_prefetch import CUDABatchPrefetcher
@@ -36,10 +42,14 @@ __all__ = [
     "CUDABatchPrefetcher",
     "MappedCollectionDataModule",
     "TileDBDataModule",
+    "ZARR_DATAMODULE_KWARGS",
+    "ZarrAnnDataModule",
     "ZarrCSRSource",
     "ZarrDataset",
     "ZarrMatrixSource",
     "ZarrMultiVIDataModule",
     "csr_sources_from_backed_mudata",
+    "matrix_sources_from_backed_anndata",
     "matrix_sources_from_backed_mudata",
+    "try_auto_zarr_anndata_datamodule",
 ]

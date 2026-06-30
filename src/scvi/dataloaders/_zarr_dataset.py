@@ -20,8 +20,11 @@ from torch.utils.data import IterableDataset, get_worker_info
 from scvi import REGISTRY_KEYS
 
 if TYPE_CHECKING:
+    from anndata import AnnData
     from anndata.abc import CSRDataset
     from mudata import MuData
+
+    from scvi.data._manager import AnnDataManager
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +37,7 @@ _INT64_OBS_KEYS = frozenset({
     REGISTRY_KEYS.BATCH_KEY,
     REGISTRY_KEYS.LABELS_KEY,
     REGISTRY_KEYS.INDICES_KEY,
+    REGISTRY_KEYS.CAT_COVS_KEY,
 })
 
 
@@ -347,6 +351,88 @@ def _infer_matrix_layout(matrix) -> MatrixLayout:
     if sp.issparse(matrix):
         return "csr"
     return "dense"
+
+
+def _annadata_matrix_relpath(
+    matrix,
+    *,
+    attr_name: str,
+    attr_key: str | None,
+    matrix_layout: MatrixLayout,
+    store_dir: Path | None,
+    x_suffix: str,
+) -> str:
+    """Resolve a zarr path for a backed AnnData matrix (``X`` or layer)."""
+    if matrix_layout == "csr":
+        return str(_zarr_csr_group_path(matrix))
+    try:
+        return str(_zarr_dense_array_path(matrix))
+    except (TypeError, ValueError):
+        if store_dir is None:
+            raise ValueError("store_dir is required for dense matrix path inference.")
+        dense_suffix = x_suffix if x_suffix else "_dense"
+        if attr_key is None:
+            return str(store_dir / f"X{dense_suffix}")
+        return str(store_dir / "layers" / attr_key / f"X{dense_suffix}")
+
+
+def matrix_sources_from_backed_anndata(
+    adata: AnnData,
+    adata_manager: AnnDataManager,
+    *,
+    registry_key: str = REGISTRY_KEYS.X_KEY,
+    validate: bool = True,
+    n_obs: int | None = None,
+    x_suffix: str = "",
+    layout: MatrixLayout | Literal["auto"] = "auto",
+    store_dir: Path | str | None = None,
+) -> dict[str, ZarrMatrixSource]:
+    """Build picklable :class:`ZarrMatrixSource` descriptors from a backed AnnData.
+
+    Resolves the registered count matrix (typically ``REGISTRY_KEYS.X_KEY``) from
+    backed ``adata.X`` or a registered layer and infers CSR vs dense layout when
+    ``layout='auto'``.
+    """
+    if registry_key not in adata_manager.data_registry:
+        raise KeyError(f"Registry key {registry_key!r} not found in adata_manager.")
+
+    expected_n_obs = adata.n_obs if n_obs is None else n_obs
+    resolved_store = Path(store_dir) if store_dir is not None else None
+    data_loc = adata_manager.data_registry[registry_key]
+
+    from scvi.data._utils import get_anndata_attribute
+
+    matrix = get_anndata_attribute(
+        adata,
+        data_loc.attr_name,
+        data_loc.attr_key,
+        mod_key=getattr(data_loc, "mod_key", None),
+    )
+    matrix_layout: MatrixLayout = _infer_matrix_layout(matrix) if layout == "auto" else layout
+
+    if x_suffix and resolved_store is None:
+        raise ValueError("store_dir is required when using x_suffix for matrix paths.")
+
+    x_relpath = _annadata_matrix_relpath(
+        matrix,
+        attr_name=data_loc.attr_name,
+        attr_key=data_loc.attr_key,
+        matrix_layout=matrix_layout,
+        store_dir=resolved_store,
+        x_suffix=x_suffix,
+    )
+    sources = {
+        registry_key: ZarrMatrixSource(registry_key, x_relpath, layout=matrix_layout)
+    }
+
+    if validate:
+        opened = _open_matrix_sources(resolved_store, sources)
+        n_rows = next(iter(opened.values())).shape[0]
+        if n_rows != expected_n_obs:
+            raise ValueError(
+                f"Matrix for {registry_key!r} has {n_rows} rows, expected {expected_n_obs}."
+            )
+    return sources
 
 
 def matrix_sources_from_backed_mudata(
@@ -710,9 +796,12 @@ class ZarrDataset(IterableDataset):
             stacked = buffer.stacked_obs(key)
             values = np.asarray(stacked[row_positions])
             if key in _INT64_OBS_KEYS:
-                out[key] = torch.as_tensor(values, dtype=torch.int64).reshape(-1, 1)
+                tensor = torch.as_tensor(values, dtype=torch.int64)
             else:
-                out[key] = torch.as_tensor(values).reshape(-1, 1)
+                tensor = torch.as_tensor(values, dtype=torch.float32)
+            if tensor.ndim == 1:
+                tensor = tensor.reshape(-1, 1)
+            out[key] = tensor
         return out
 
     def _emit_buffered_batches(

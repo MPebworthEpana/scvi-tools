@@ -86,6 +86,7 @@ class PEAKVI(ArchesMixin, RNASeqMixin, VAEMixin, UnsupervisedTrainingMixin, Base
     1. :doc:`/tutorials/notebooks/atac/PeakVI`
     """
 
+    _supports_zarr_streaming = True
     _module_cls = PEAKVAE
 
     def __init__(

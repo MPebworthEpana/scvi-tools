@@ -13,4 +13,5 @@ scvi_criticism
 training_configuration
 using_callbacks
 zarr_multivi_streaming
+zarr_anndata_streaming
 ```
