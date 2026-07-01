@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import scanpy as sc
 import scipy.sparse as sp
+import torch
 import zarr
 from anndata.io import sparse_dataset
 from mudata import MuData
@@ -15,7 +16,7 @@ from mudata import MuData
 import scvi
 from scvi import REGISTRY_KEYS
 from scvi.data import synthetic_iid
-from scvi.dataloaders import DataSplitter, ZarrMultiVIDataModule
+from scvi.dataloaders import DataSplitter, ZarrMultiVIDataModule, try_zarr_inference_dataloader_from_mudata
 from scvi.model import MULTIVI
 from scvi.utils import attrdict
 
@@ -584,7 +585,15 @@ def _make_rna_protein_mixed_zarr_store(
     )
     arr[:] = protein_dense.astype(np.float32, copy=False)
     backed.mod[protein_mod].X = zarr.open_array(str(dest), mode="r")
-    return mdata, backed, store_path
+    ordered = md.MuData({
+        "RNA": backed.mod["RNA"],
+        protein_mod: backed.mod[protein_mod],
+    })
+    ordered.obs = backed.obs.copy()
+    if backed.obsm:
+        ordered.obsm = dict(backed.obsm)
+    ordered.update()
+    return mdata, ordered, store_path
 
 
 def test_multivi_setup_mudata_rna_csr_protein_dense_zarr(tmp_path):
@@ -600,6 +609,81 @@ def test_multivi_setup_mudata_rna_csr_protein_dense_zarr(tmp_path):
     model = MULTIVI(mdata_backed)
     assert REGISTRY_KEYS.PROTEIN_EXP_KEY in model.adata_manager.data_registry
     assert model.summary_stats.n_proteins == mdata.mod["protein_expression"].n_vars
+
+
+def test_try_zarr_inference_dataloader_mixed_csr_dense(tmp_path):
+    """Inference loader yields float32 count tensors for RNA CSR + protein dense zarr."""
+    _, mdata_backed, _ = _make_rna_protein_mixed_zarr_store(tmp_path)
+    MULTIVI.setup_mudata(
+        mdata_backed,
+        batch_key="batch",
+        modalities={"rna_layer": "RNA", "protein_layer": "protein_expression"},
+    )
+    model = MULTIVI(mdata_backed)
+    loader = try_zarr_inference_dataloader_from_mudata(
+        mdata_backed,
+        model.adata_manager,
+        batch_size=16,
+        zarr_kwargs={"num_workers": 0, "block_size": 16},
+    )
+    assert loader is not None
+    batch = next(iter(loader))
+    assert batch[REGISTRY_KEYS.X_KEY].dtype == torch.float32
+    assert batch[REGISTRY_KEYS.PROTEIN_EXP_KEY].dtype == torch.float32
+
+
+def test_multivi_get_latent_after_zarr_train_mixed_layout(tmp_path):
+    """get_latent_representation auto-uses zarr inference after mixed-layout zarr training."""
+    _, mdata_backed, store_path = _make_rna_protein_mixed_zarr_store(tmp_path)
+    MULTIVI.setup_mudata(
+        mdata_backed,
+        batch_key="batch",
+        modalities={"rna_layer": "RNA", "protein_layer": "protein_expression"},
+    )
+    model = MULTIVI(mdata_backed)
+    dm = ZarrMultiVIDataModule.from_backed_mudata(
+        mdata_backed,
+        model.adata_manager,
+        matrix_layout="auto",
+        store_dir=store_path,
+        train_size=0.8,
+        batch_size=16,
+        block_size=16,
+        shuffle_buffer_blocks=2,
+        num_workers=0,
+        seed=0,
+    )
+    model.train(
+        max_epochs=1,
+        datamodule=dm,
+        early_stopping=False,
+        check_val_every_n_epoch=1,
+    )
+    latent = model.get_latent_representation()
+    assert latent.shape == (mdata_backed.n_obs, model.module.n_latent)
+    assert np.isfinite(latent).all()
+
+
+def test_multivi_get_latent_auto_zarr_train_mixed_layout(tmp_path):
+    """Auto zarr training persists kwargs used for latent inference on mixed layouts."""
+    _, mdata_backed, _ = _make_rna_protein_mixed_zarr_store(tmp_path)
+    MULTIVI.setup_mudata(
+        mdata_backed,
+        batch_key="batch",
+        modalities={"rna_layer": "RNA", "protein_layer": "protein_expression"},
+    )
+    model = MULTIVI(mdata_backed)
+    model.train(
+        max_epochs=1,
+        batch_size=16,
+        datasplitter_kwargs={"block_size": 16, "num_workers": 0, "shuffle_buffer_blocks": 2},
+        early_stopping=False,
+        check_val_every_n_epoch=1,
+    )
+    assert model._zarr_dataloader_kwargs is not None
+    latent = model.get_latent_representation()
+    assert latent.shape == (mdata_backed.n_obs, model.module.n_latent)
+    assert np.isfinite(latent).all()
 
 
 @pytest.mark.parametrize("dispersion", ["gene"])

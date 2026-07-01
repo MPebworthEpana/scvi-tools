@@ -30,7 +30,11 @@ from scvi.model.base import (
     VAEMixin,
 )
 from scvi.dataloaders import ZarrMultiVIDataModule
-from scvi.dataloaders._zarr_datamodule import ZARR_DATAMODULE_KWARGS, DATASPLITTER_ONLY_KWARGS
+from scvi.dataloaders._zarr_datamodule import (
+    ZARR_DATAMODULE_KWARGS,
+    DATASPLITTER_ONLY_KWARGS,
+    try_zarr_inference_dataloader_from_mudata,
+)
 from scvi.model.base._de_core import _de_core
 from scvi.module import MULTIVAE
 from scvi.train import AdversarialTrainingPlan
@@ -45,6 +49,7 @@ if TYPE_CHECKING:
     from anndata import AnnData
     from lightning.pytorch.core import LightningDataModule
     from torch import Tensor
+    from torch.utils.data import DataLoader
 
     from scvi._types import AnnOrMuData, Number
 
@@ -243,6 +248,7 @@ class MULTIVI(
         self.n_regions = n_regions
         self.n_proteins = n_proteins
         self.get_normalized_function_name = "get_normalized_accessibility"
+        self._zarr_dataloader_kwargs: dict | None = None
 
     def _try_auto_zarr_datamodule(
         self,
@@ -291,12 +297,44 @@ class MULTIVI(
             )
         except Exception as exc:
             logger.debug("Zarr datamodule auto-selection failed: %s", exc)
+            self._zarr_dataloader_kwargs = None
             return None
 
+        self._zarr_dataloader_kwargs = zarr_kwargs
         logger.info(
             "Detected zarr-backed modality matrices; using ZarrMultiVIDataModule for training."
         )
         return datamodule
+
+    def _try_make_zarr_inference_dataloader(
+        self,
+        adata: MuData,
+        *,
+        indices: Sequence[int] | None,
+        batch_size: int,
+        zarr_dataloader_kwargs: dict | None = None,
+    ) -> DataLoader | None:
+        """Return a zarr streaming inference dataloader when ``mdata`` is zarr-backed."""
+        merged_kwargs = dict(getattr(self, "_zarr_dataloader_kwargs", None) or {})
+        if zarr_dataloader_kwargs:
+            merged_kwargs.update(zarr_dataloader_kwargs)
+        filtered_kwargs = {
+            key: merged_kwargs[key]
+            for key in _ZARR_DATAMODULE_KWARGS & merged_kwargs.keys()
+        }
+
+        loader = try_zarr_inference_dataloader_from_mudata(
+            adata,
+            self.adata_manager,
+            indices=indices,
+            batch_size=batch_size,
+            zarr_kwargs=filtered_kwargs,
+        )
+        if loader is not None:
+            logger.info(
+                "Detected zarr-backed modality matrices; using ZarrDataset for latent inference."
+            )
+        return loader
 
     @devices_dsp.dedent
     def train(
@@ -405,6 +443,7 @@ class MULTIVI(
             if datamodule is not None:
                 auto_zarr_datamodule = True
             else:
+                self._zarr_dataloader_kwargs = None
                 splitter_kwargs = dict(datasplitter_kwargs)
                 datamodule = self._data_splitter_cls(
                     self.adata_manager,
@@ -505,6 +544,7 @@ class MULTIVI(
         batch_size: int | None = None,
         return_dist: bool = False,
         dataloader: Iterator[dict[str, Tensor | None]] | None = None,
+        **data_loader_kwargs,
     ) -> np.ndarray:
         r"""Return the latent representation for each cell.
 
@@ -526,7 +566,13 @@ class MULTIVI(
             returns the mean of the latent distribution.
         dataloader
             An iterator over minibatches of data on which to compute the representation. If
-            ``None``, a dataloader is created from ``adata``.
+            ``None``, a dataloader is created from ``adata``. When ``adata`` is a zarr-backed
+            :class:`~mudata.MuData`, a :class:`~scvi.dataloaders.ZarrDataset` inference loader
+            is used automatically if all registered modality matrices are zarr-backed.
+        **data_loader_kwargs
+            Keyword arguments passed to the data loader. For zarr-backed MuData, supported keys
+            are those in :data:`~scvi.dataloaders.ZARR_DATAMODULE_KWARGS` (e.g. ``num_workers``,
+            ``block_size``).
 
         Returns
         -------
@@ -554,7 +600,22 @@ class MULTIVI(
 
         if dataloader is None:
             adata = self._validate_anndata(adata)
-            scdl = self._make_data_loader(adata=adata, indices=indices, batch_size=batch_size)
+            resolved_batch_size = batch_size or settings.batch_size
+            scdl = None
+            if isinstance(adata, MuData):
+                scdl = self._try_make_zarr_inference_dataloader(
+                    adata,
+                    indices=indices,
+                    batch_size=resolved_batch_size,
+                    zarr_dataloader_kwargs=data_loader_kwargs,
+                )
+            if scdl is None:
+                scdl = self._make_data_loader(
+                    adata=adata,
+                    indices=indices,
+                    batch_size=resolved_batch_size,
+                    **(data_loader_kwargs or {}),
+                )
         else:
             scdl = dataloader
         latent = []

@@ -11,6 +11,7 @@ from ._zarr_datamodule import (
     ZarrAnnDataModule,
     ZarrMultiVIDataModule,
     try_auto_zarr_anndata_datamodule,
+    try_zarr_inference_dataloader_from_mudata,
 )
 from ._zarr_dataset import (
     ZarrCSRSource,
@@ -52,4 +53,5 @@ __all__ = [
     "matrix_sources_from_backed_anndata",
     "matrix_sources_from_backed_mudata",
     "try_auto_zarr_anndata_datamodule",
+    "try_zarr_inference_dataloader_from_mudata",
 ]

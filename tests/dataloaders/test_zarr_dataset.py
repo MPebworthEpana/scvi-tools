@@ -512,6 +512,7 @@ def test_multivi_zarr_datamodule_smoke(zarr_store):
     latent = model.get_latent_representation()
     assert latent.shape[0] == mdata_backed.n_obs
     assert latent.shape[1] == model.module.n_latent
+    assert np.isfinite(latent).all()
 
 
 def _write_dense_layers_from_csr(store_path: Path, mdata_backed: MuData, *, block_size: int = 64) -> None:

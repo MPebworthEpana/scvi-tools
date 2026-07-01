@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -67,6 +68,259 @@ _JOINT_OBS_KEYS = frozenset({
 })
 
 
+def infer_registry_map(adata_manager: AnnDataManager) -> dict[str, str]:
+    """Infer modality registry keys to MuData mod keys from an AnnDataManager."""
+    registry_map: dict[str, str] = {}
+    for key in (
+        REGISTRY_KEYS.X_KEY,
+        REGISTRY_KEYS.ATAC_X_KEY,
+        REGISTRY_KEYS.PROTEIN_EXP_KEY,
+    ):
+        if key not in adata_manager.data_registry:
+            continue
+        data_loc = adata_manager.data_registry[key]
+        mod_key = getattr(data_loc, "mod_key", None)
+        if mod_key is None:
+            raise ValueError(
+                f"Registry key {key!r} has no mod_key; pass registry_map explicitly."
+            )
+        registry_map[key] = mod_key
+    if not registry_map:
+        raise ValueError(
+            "Could not infer registry_map from adata_manager. "
+            "Pass registry_map={REGISTRY_KEYS.X_KEY: 'RNA', ...} explicitly."
+        )
+    return registry_map
+
+
+def _validate_obs_fields(adata_manager: AnnDataManager) -> None:
+    registry = adata_manager.data_registry
+    if REGISTRY_KEYS.SIZE_FACTOR_KEY in registry:
+        data_loc = registry[REGISTRY_KEYS.SIZE_FACTOR_KEY]
+        values = get_anndata_attribute(
+            adata_manager.adata,
+            data_loc.attr_name,
+            data_loc.attr_key,
+            mod_key=getattr(data_loc, "mod_key", None),
+        )
+        arr = np.asarray(values)
+        if arr.ndim > 1 and arr.shape[1] > 1:
+            raise NotImplementedError(
+                "Zarr datamodules do not yet support multi-column size factors."
+            )
+
+
+def _registry_obs_array(adata_manager: AnnDataManager, registry_key: str) -> np.ndarray:
+    data_loc = adata_manager.data_registry[registry_key]
+    mod_key = getattr(data_loc, "mod_key", None)
+    values = get_anndata_attribute(
+        adata_manager.adata,
+        data_loc.attr_name,
+        data_loc.attr_key,
+        mod_key=mod_key,
+    )
+    dtype = registry_key_to_default_dtype(registry_key)
+    arr = np.asarray(values, dtype=dtype)
+
+    if registry_key in _SCALAR_OBS_KEYS:
+        if arr.ndim == 2 and arr.shape[1] == 1:
+            arr = arr.reshape(-1)
+        if arr.ndim != 1:
+            raise NotImplementedError(
+                f"Registry key {registry_key!r} must be 1-D per observation; "
+                f"got shape {arr.shape}."
+            )
+        return arr
+
+    if registry_key in _JOINT_OBS_KEYS:
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        if arr.ndim != 2:
+            raise NotImplementedError(
+                f"Registry key {registry_key!r} must be 2-D per observation; "
+                f"got shape {arr.shape}."
+            )
+        return arr
+
+    if arr.ndim == 2 and arr.shape[1] == 1:
+        arr = arr.reshape(-1)
+    if arr.ndim != 1:
+        raise NotImplementedError(
+            f"Registry key {registry_key!r} must be 1-D or 2-D per observation; "
+            f"got shape {arr.shape}."
+        )
+    return arr
+
+
+def build_obs_tensors(adata_manager: AnnDataManager, n_obs: int) -> dict[str, np.ndarray]:
+    """Build per-observation registry tensors for zarr streaming."""
+    _validate_obs_fields(adata_manager)
+    obs_tensors: dict[str, np.ndarray] = {}
+
+    if REGISTRY_KEYS.INDICES_KEY in adata_manager.data_registry:
+        obs_tensors[REGISTRY_KEYS.INDICES_KEY] = _registry_obs_array(
+            adata_manager, REGISTRY_KEYS.INDICES_KEY
+        )
+    else:
+        obs_tensors[REGISTRY_KEYS.INDICES_KEY] = np.arange(n_obs, dtype=np.int64)
+
+    obs_tensors[REGISTRY_KEYS.BATCH_KEY] = _registry_obs_array(
+        adata_manager, REGISTRY_KEYS.BATCH_KEY
+    )
+
+    if REGISTRY_KEYS.LABELS_KEY in adata_manager.data_registry:
+        obs_tensors[REGISTRY_KEYS.LABELS_KEY] = _registry_obs_array(
+            adata_manager, REGISTRY_KEYS.LABELS_KEY
+        )
+    else:
+        obs_tensors[REGISTRY_KEYS.LABELS_KEY] = np.zeros(n_obs, dtype=np.int64)
+
+    if REGISTRY_KEYS.SIZE_FACTOR_KEY in adata_manager.data_registry:
+        obs_tensors[REGISTRY_KEYS.SIZE_FACTOR_KEY] = _registry_obs_array(
+            adata_manager, REGISTRY_KEYS.SIZE_FACTOR_KEY
+        )
+
+    for key in (REGISTRY_KEYS.CAT_COVS_KEY, REGISTRY_KEYS.CONT_COVS_KEY):
+        if key in adata_manager.data_registry:
+            obs_tensors[key] = _registry_obs_array(adata_manager, key)
+
+    return obs_tensors
+
+
+def _wrap_zarr_dataset_in_dataloader(
+    dataset: ZarrDataset,
+    *,
+    num_workers: int,
+    pin_memory: bool,
+    prefetch_factor: int | None,
+    prefetch_to_gpu: bool,
+    cuda_queue_depth: int,
+    persistent_workers: bool,
+) -> DataLoader:
+    dataloader_kwargs: dict = {}
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = 2 if prefetch_factor is None else prefetch_factor
+    loader = DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers and num_workers > 0,
+        collate_fn=_identity_collate,
+        **dataloader_kwargs,
+    )
+    return maybe_wrap_cuda_prefetch(
+        loader,
+        prefetch_to_gpu=prefetch_to_gpu,
+        cuda_queue_depth=cuda_queue_depth,
+        pin_memory=pin_memory,
+        load_sparse_tensor=False,
+    )
+
+
+def make_zarr_inference_dataloader(
+    adata_manager: AnnDataManager,
+    mdata: MuData,
+    *,
+    indices: Sequence[int] | np.ndarray | None,
+    batch_size: int,
+    matrix_sources: dict[str, ZarrMatrixSource],
+    store_dir: Path | str | None,
+    zarr_kwargs: dict | None = None,
+) -> DataLoader:
+    """Build a sequential zarr streaming dataloader for model inference."""
+    zarr_kwargs = zarr_kwargs or {}
+    resolved_indices = (
+        np.arange(mdata.n_obs, dtype=np.int64)
+        if indices is None
+        else np.asarray(indices, dtype=np.int64)
+    )
+    obs_tensors = build_obs_tensors(adata_manager, mdata.n_obs)
+    resolved_store_dir = Path(store_dir) if store_dir is not None else None
+
+    block_size = zarr_kwargs.get("block_size", 4096)
+    num_workers = zarr_kwargs.get("num_workers", settings.dl_num_workers)
+    if num_workers is None:
+        num_workers = settings.dl_num_workers
+    pin_memory = zarr_kwargs.get("pin_memory", False)
+    prefetch_factor = zarr_kwargs.get("prefetch_factor")
+    prefetch_to_gpu = zarr_kwargs.get("prefetch_to_gpu", False)
+    cuda_queue_depth = zarr_kwargs.get("cuda_queue_depth", 2)
+    persistent_workers = zarr_kwargs.get(
+        "persistent_workers", settings.dl_persistent_workers
+    )
+    prefetch_queue_depth = zarr_kwargs.get("prefetch_queue_depth", 0)
+    block_prefetch_depth = zarr_kwargs.get("block_prefetch_depth", 0)
+    emit_mode = zarr_kwargs.get("emit_mode", "flush")
+    seed = zarr_kwargs.get("seed", 0)
+
+    dataset = ZarrDataset(
+        obs_tensors=obs_tensors,
+        indices=resolved_indices,
+        matrix_sources=matrix_sources,
+        store_dir=resolved_store_dir,
+        batch_size=batch_size,
+        block_size=block_size,
+        shuffle=False,
+        shuffle_buffer_blocks=zarr_kwargs.get("shuffle_buffer_blocks", 16),
+        emit_mode=emit_mode,
+        prefetch_queue_depth=prefetch_queue_depth,
+        block_prefetch_depth=block_prefetch_depth,
+        seed=seed,
+        epoch=0,
+        drop_last=False,
+    )
+    return _wrap_zarr_dataset_in_dataloader(
+        dataset,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        prefetch_to_gpu=prefetch_to_gpu,
+        cuda_queue_depth=cuda_queue_depth,
+        persistent_workers=persistent_workers,
+    )
+
+
+def try_zarr_inference_dataloader_from_mudata(
+    mdata: MuData,
+    adata_manager: AnnDataManager,
+    *,
+    indices: Sequence[int] | None = None,
+    batch_size: int,
+    zarr_kwargs: dict | None = None,
+) -> DataLoader | None:
+    """Return a zarr streaming inference dataloader when ``mdata`` is zarr-backed."""
+    zarr_kwargs = zarr_kwargs or {}
+    try:
+        registry_map = infer_registry_map(adata_manager)
+        store_dir: Path | str | None = None
+        candidate = getattr(mdata, "filename", None)
+        if isinstance(candidate, (str, Path)):
+            store_dir = candidate
+
+        source_kwargs: dict = {
+            "n_obs": mdata.n_obs,
+            "layout": "auto",
+        }
+        if store_dir is not None:
+            source_kwargs["store_dir"] = store_dir
+
+        sources = matrix_sources_from_backed_mudata(mdata, registry_map, **source_kwargs)
+        resolved_store_dir = Path(store_dir) if store_dir is not None else None
+        return make_zarr_inference_dataloader(
+            adata_manager,
+            mdata,
+            indices=indices,
+            batch_size=batch_size,
+            matrix_sources=sources,
+            store_dir=resolved_store_dir,
+            zarr_kwargs=zarr_kwargs,
+        )
+    except Exception as exc:
+        logger.debug("Zarr inference dataloader auto-selection failed: %s", exc)
+        return None
+
+
 class _BaseZarrDataModule(pl.LightningDataModule):
     """Shared zarr streaming datamodule logic for IterableDataset-backed training."""
 
@@ -127,8 +381,8 @@ class _BaseZarrDataModule(pl.LightningDataModule):
         self._train_dataset: ZarrDataset | None = None
         self._val_dataset: ZarrDataset | None = None
 
-        self._validate_obs_fields()
-        self.obs_tensors = self._build_obs_tensors()
+        _validate_obs_fields(adata_manager)
+        self.obs_tensors = build_obs_tensors(adata_manager, self.n_obs)
         self._split_indices()
 
     @property
@@ -154,91 +408,13 @@ class _BaseZarrDataModule(pl.LightningDataModule):
         return self.adata_manager.get_state_registry(REGISTRY_KEYS.CAT_COVS_KEY).n_cats_per_key
 
     def _validate_obs_fields(self) -> None:
-        registry = self.adata_manager.data_registry
-        if REGISTRY_KEYS.SIZE_FACTOR_KEY in registry:
-            data_loc = registry[REGISTRY_KEYS.SIZE_FACTOR_KEY]
-            values = get_anndata_attribute(
-                self.adata_manager.adata,
-                data_loc.attr_name,
-                data_loc.attr_key,
-                mod_key=getattr(data_loc, "mod_key", None),
-            )
-            arr = np.asarray(values)
-            if arr.ndim > 1 and arr.shape[1] > 1:
-                raise NotImplementedError(
-                    "Zarr datamodules do not yet support multi-column size factors."
-                )
+        _validate_obs_fields(self.adata_manager)
 
     def _registry_obs_array(self, registry_key: str) -> np.ndarray:
-        data_loc = self.adata_manager.data_registry[registry_key]
-        mod_key = getattr(data_loc, "mod_key", None)
-        values = get_anndata_attribute(
-            self.adata_manager.adata,
-            data_loc.attr_name,
-            data_loc.attr_key,
-            mod_key=mod_key,
-        )
-        dtype = registry_key_to_default_dtype(registry_key)
-        arr = np.asarray(values, dtype=dtype)
-
-        if registry_key in _SCALAR_OBS_KEYS:
-            if arr.ndim == 2 and arr.shape[1] == 1:
-                arr = arr.reshape(-1)
-            if arr.ndim != 1:
-                raise NotImplementedError(
-                    f"Registry key {registry_key!r} must be 1-D per observation; "
-                    f"got shape {arr.shape}."
-                )
-            return arr
-
-        if registry_key in _JOINT_OBS_KEYS:
-            if arr.ndim == 1:
-                arr = arr.reshape(-1, 1)
-            if arr.ndim != 2:
-                raise NotImplementedError(
-                    f"Registry key {registry_key!r} must be 2-D per observation; "
-                    f"got shape {arr.shape}."
-                )
-            return arr
-
-        if arr.ndim == 2 and arr.shape[1] == 1:
-            arr = arr.reshape(-1)
-        if arr.ndim != 1:
-            raise NotImplementedError(
-                f"Registry key {registry_key!r} must be 1-D or 2-D per observation; "
-                f"got shape {arr.shape}."
-            )
-        return arr
+        return _registry_obs_array(self.adata_manager, registry_key)
 
     def _build_obs_tensors(self) -> dict[str, np.ndarray]:
-        obs_tensors: dict[str, np.ndarray] = {}
-
-        if REGISTRY_KEYS.INDICES_KEY in self.adata_manager.data_registry:
-            obs_tensors[REGISTRY_KEYS.INDICES_KEY] = self._registry_obs_array(
-                REGISTRY_KEYS.INDICES_KEY
-            )
-        else:
-            obs_tensors[REGISTRY_KEYS.INDICES_KEY] = np.arange(self.n_obs, dtype=np.int64)
-
-        obs_tensors[REGISTRY_KEYS.BATCH_KEY] = self._registry_obs_array(REGISTRY_KEYS.BATCH_KEY)
-
-        if REGISTRY_KEYS.LABELS_KEY in self.adata_manager.data_registry:
-            obs_tensors[REGISTRY_KEYS.LABELS_KEY] = self._registry_obs_array(
-                REGISTRY_KEYS.LABELS_KEY
-            )
-        else:
-            obs_tensors[REGISTRY_KEYS.LABELS_KEY] = np.zeros(self.n_obs, dtype=np.int64)
-
-        if REGISTRY_KEYS.SIZE_FACTOR_KEY in self.adata_manager.data_registry:
-            obs_tensors[REGISTRY_KEYS.SIZE_FACTOR_KEY] = self._registry_obs_array(
-                REGISTRY_KEYS.SIZE_FACTOR_KEY
-            )
-
-        for key in (REGISTRY_KEYS.CAT_COVS_KEY, REGISTRY_KEYS.CONT_COVS_KEY):
-            if key in self.adata_manager.data_registry:
-                obs_tensors[key] = self._registry_obs_array(key)
-
-        return obs_tensors
+        return build_obs_tensors(self.adata_manager, self.n_obs)
 
     def _split_indices(self) -> None:
         n_train, n_val = validate_data_split(
@@ -288,21 +464,14 @@ class _BaseZarrDataModule(pl.LightningDataModule):
         return kwargs
 
     def _make_dataloader(self, dataset: ZarrDataset, *, persistent_workers: bool) -> DataLoader:
-        loader = DataLoader(
+        return _wrap_zarr_dataset_in_dataloader(
             dataset,
-            batch_size=None,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            persistent_workers=persistent_workers and self.num_workers > 0,
-            collate_fn=_identity_collate,
-            **self._dataloader_kwargs(),
-        )
-        return maybe_wrap_cuda_prefetch(
-            loader,
+            prefetch_factor=self.prefetch_factor,
             prefetch_to_gpu=self.prefetch_to_gpu,
             cuda_queue_depth=self.cuda_queue_depth,
-            pin_memory=self.pin_memory,
-            load_sparse_tensor=False,
+            persistent_workers=persistent_workers,
         )
 
     def train_dataloader(self) -> DataLoader:
@@ -414,26 +583,7 @@ class ZarrMultiVIDataModule(_BaseZarrDataModule):
     ) -> ZarrMultiVIDataModule:
         """EXPERIMENTAL: Create a datamodule that streams from an already-backed MuData."""
         if registry_map is None:
-            registry_map = {}
-            for key in (
-                REGISTRY_KEYS.X_KEY,
-                REGISTRY_KEYS.ATAC_X_KEY,
-                REGISTRY_KEYS.PROTEIN_EXP_KEY,
-            ):
-                if key not in adata_manager.data_registry:
-                    continue
-                data_loc = adata_manager.data_registry[key]
-                mod_key = getattr(data_loc, "mod_key", None)
-                if mod_key is None:
-                    raise ValueError(
-                        f"Registry key {key!r} has no mod_key; pass registry_map explicitly."
-                    )
-                registry_map[key] = mod_key
-            if not registry_map:
-                raise ValueError(
-                    "Could not infer registry_map from adata_manager. "
-                    "Pass registry_map={REGISTRY_KEYS.X_KEY: 'RNA', ...} explicitly."
-                )
+            registry_map = infer_registry_map(adata_manager)
 
         if matrix_layout == "dense":
             layout: str = "dense"
