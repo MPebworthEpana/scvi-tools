@@ -14,6 +14,7 @@ from ._zarr_datamodule import (
     try_zarr_inference_dataloader_from_mudata,
 )
 from ._zarr_dataset import (
+    DEFAULT_PREFETCH_QUEUE_DEPTH,
     ZarrCSRSource,
     ZarrDataset,
     ZarrMatrixSource,
@@ -41,6 +42,7 @@ __all__ = [
     "SemiSupervisedDataSplitter",
     "BatchDistributedSampler",
     "CUDABatchPrefetcher",
+    "DEFAULT_PREFETCH_QUEUE_DEPTH",
     "MappedCollectionDataModule",
     "TileDBDataModule",
     "ZARR_DATAMODULE_KWARGS",

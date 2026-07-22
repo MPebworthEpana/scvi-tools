@@ -19,6 +19,7 @@ from scvi.data._utils import get_anndata_attribute, registry_key_to_default_dtyp
 from scvi.dataloaders._cuda_prefetch import maybe_wrap_cuda_prefetch
 from scvi.dataloaders._data_splitting import validate_data_split
 from scvi.dataloaders._zarr_dataset import (
+    DEFAULT_PREFETCH_QUEUE_DEPTH,
     ZarrCSRSource,
     ZarrDataset,
     ZarrMatrixSource,
@@ -249,7 +250,9 @@ def make_zarr_inference_dataloader(
     persistent_workers = zarr_kwargs.get(
         "persistent_workers", settings.dl_persistent_workers
     )
-    prefetch_queue_depth = zarr_kwargs.get("prefetch_queue_depth", 0)
+    prefetch_queue_depth = zarr_kwargs.get(
+        "prefetch_queue_depth", DEFAULT_PREFETCH_QUEUE_DEPTH
+    )
     block_prefetch_depth = zarr_kwargs.get("block_prefetch_depth", 0)
     emit_mode = zarr_kwargs.get("emit_mode", "flush")
     seed = zarr_kwargs.get("seed", 0)
@@ -338,7 +341,7 @@ class _BaseZarrDataModule(pl.LightningDataModule):
         block_size: int = 4096,
         shuffle_buffer_blocks: int = 16,
         emit_mode: EmitMode = "rolling",
-        prefetch_queue_depth: int = 0,
+        prefetch_queue_depth: int = DEFAULT_PREFETCH_QUEUE_DEPTH,
         block_prefetch_depth: int = 0,
         prefetch_factor: int | None = None,
         num_workers: int | None = None,

@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 MatrixLayout = Literal["csr", "dense"]
 EmitMode = Literal["rolling", "flush"]
+DEFAULT_PREFETCH_QUEUE_DEPTH = 3
 
 _PREFETCH_SENTINEL = object()
 
@@ -604,8 +605,9 @@ class ZarrDataset(IterableDataset):
         ``'rolling'`` emits one minibatch at a time once the shuffle pool is large
         enough; ``'flush'`` retains the legacy flush-all-then-clear behavior.
     prefetch_queue_depth
-        If positive, queue up to this many densified CPU batches per worker via a
-        background producer thread.
+        Queue up to this many densified CPU batches per worker via a background
+        producer thread. ``0`` disables prefetch. Default is
+        :data:`~scvi.dataloaders.DEFAULT_PREFETCH_QUEUE_DEPTH`.
     block_prefetch_depth
         If positive, queue up to this many raw zarr blocks ahead of densification.
     seed
@@ -631,7 +633,7 @@ class ZarrDataset(IterableDataset):
         shuffle: bool = True,
         shuffle_buffer_blocks: int = 16,
         emit_mode: EmitMode = "rolling",
-        prefetch_queue_depth: int = 0,
+        prefetch_queue_depth: int = DEFAULT_PREFETCH_QUEUE_DEPTH,
         block_prefetch_depth: int = 0,
         seed: int = 0,
         epoch: int = 0,

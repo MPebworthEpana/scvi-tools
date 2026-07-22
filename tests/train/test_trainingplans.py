@@ -84,6 +84,88 @@ def _make_semisupervised_adversarial_plan(adversarial_classifier=False, **plan_k
     return plan, opt1, None, batch
 
 
+from scvi.train._trainingplans import (
+    SemiSupervisedAdversarialTrainingPlan,
+    _compute_kl_weight,
+)
+
+
+def test_sync_skip_decision_without_distributed():
+    plan, _, _, batch = _make_adversarial_plan()
+    device = batch[REGISTRY_KEYS.BATCH_KEY].device
+    with patch("scvi.train._trainingplans.dist.is_available", return_value=False):
+        assert plan._sync_skip_decision(True, device) is True
+        assert plan._sync_skip_decision(False, device) is False
+
+
+def test_sync_skip_decision_all_reduce_skips_when_any_rank_bad():
+    plan, _, _, batch = _make_adversarial_plan()
+    device = batch[REGISTRY_KEYS.BATCH_KEY].device
+
+    def fake_all_reduce(tensor, op=None):
+        tensor.fill_(1.0)
+
+    with (
+        patch("scvi.train._trainingplans.dist.is_available", return_value=True),
+        patch("scvi.train._trainingplans.dist.is_initialized", return_value=True),
+        patch("scvi.train._trainingplans.dist.get_world_size", return_value=2),
+        patch("scvi.train._trainingplans.dist.all_reduce", side_effect=fake_all_reduce),
+    ):
+        assert plan._sync_skip_decision(False, device) is True
+
+
+def test_sync_skip_decision_all_reduce_keeps_step_when_all_ranks_ok():
+    plan, _, _, batch = _make_adversarial_plan()
+    device = batch[REGISTRY_KEYS.BATCH_KEY].device
+
+    with (
+        patch("scvi.train._trainingplans.dist.is_available", return_value=True),
+        patch("scvi.train._trainingplans.dist.is_initialized", return_value=True),
+        patch("scvi.train._trainingplans.dist.get_world_size", return_value=2),
+        patch("scvi.train._trainingplans.dist.all_reduce"),
+    ):
+        assert plan._sync_skip_decision(False, device) is False
+
+
+def test_adversarial_plan_max_consecutive_skips_raises():
+    plan, _, _, batch = _make_adversarial_plan(max_consecutive_skips=2)
+    device = batch[REGISTRY_KEYS.BATCH_KEY].device
+
+    def forward_with_nan(*args, **kwargs):
+        inference_outputs, _, _ = _finite_forward_return(device, plan.module.n_latent)
+        scvi_loss = LossOutput(
+            loss=torch.tensor(float("nan"), device=device),
+            n_obs_minibatch=4,
+        )
+        return inference_outputs, None, scvi_loss
+
+    plan.forward = forward_with_nan
+    with patch("scvi.train._trainingplans.warnings.warn"):
+        plan.training_step(batch, 0)
+        plan.training_step(batch, 1)
+        with pytest.raises(RuntimeError, match="max_consecutive_skips=2"):
+            plan.training_step(batch, 2)
+
+
+def test_adversarial_plan_syncs_skip_decision_under_distributed():
+    plan, opt1, opt2, batch = _make_adversarial_plan(adversarial_classifier=False)
+    device = batch[REGISTRY_KEYS.BATCH_KEY].device
+    plan.forward = lambda *args, **kwargs: _finite_forward_return(
+        device, plan.module.n_latent
+    )
+
+    with (
+        patch.object(plan, "_sync_skip_decision", return_value=True) as sync_mock,
+        patch("scvi.train._trainingplans.warnings.warn"),
+    ):
+        result = plan.training_step(batch, 0)
+
+    sync_mock.assert_called_once()
+    assert result.item() == 0.0
+    opt1.step.assert_not_called()
+    plan.manual_backward.assert_not_called()
+
+
 @pytest.mark.parametrize("adversarial_classifier", [False, True])
 def test_adversarial_plan_warns_on_nonfinite_loss_skip(adversarial_classifier):
     plan, opt1, opt2, batch = _make_adversarial_plan(

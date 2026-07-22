@@ -386,6 +386,9 @@ class MULTIVI(
             Optimizer eps
         early_stopping
             Whether to perform early stopping with respect to the validation set.
+            When ``True``, early stopping warmup defaults to ``n_epochs_kl_warmup`` so
+            monitoring begins after KL warmup unless ``early_stopping_warmup_epochs`` is
+            passed explicitly.
         check_val_every_n_epoch
             Check val every n train epochs. By default, val is not checked, unless `early_stopping`
             is `True`. If so, val is checked every epoch.
@@ -467,6 +470,12 @@ class MULTIVI(
 
         training_plan = self._training_plan_cls(self.module, **plan_kwargs)
         trainer_kwargs = dict(kwargs)
+        if early_stopping and "early_stopping_warmup_epochs" not in trainer_kwargs:
+            trainer_kwargs["early_stopping_warmup_epochs"] = (
+                n_epochs_kl_warmup if n_epochs_kl_warmup is not None else 0
+            )
+        if "early_stopping_patience" not in trainer_kwargs:
+            trainer_kwargs["early_stopping_patience"] = 50
         non_default_datamodule = user_provided_datamodule or auto_zarr_datamodule
         if non_default_datamodule and "reload_dataloaders_every_n_epochs" not in trainer_kwargs:
             trainer_kwargs["reload_dataloaders_every_n_epochs"] = 1
@@ -480,7 +489,6 @@ class MULTIVI(
             early_stopping=early_stopping,
             check_val_every_n_epoch=check_val_every_n_epoch,
             early_stopping_monitor="reconstruction_loss_validation",
-            early_stopping_patience=50,
             **trainer_kwargs,
         )
         return runner()

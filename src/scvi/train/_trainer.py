@@ -131,12 +131,6 @@ class Trainer(pl.Trainer):
 
         save_log_on_disk = True if log_save_dir else False
         if use_distributed_sampler(kwargs.get("strategy", None)):
-            warnings.warn(
-                "early_stopping was automatically disabled due to the use of DDP",
-                UserWarning,
-                stacklevel=settings.warnings_stacklevel,
-            )
-            early_stopping = False
             save_log_on_disk = True
 
         if early_stopping:

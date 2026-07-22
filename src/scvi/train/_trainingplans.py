@@ -9,6 +9,7 @@ import lightning.pytorch as pl
 import numpy as np
 import pyro
 import torch
+import torch.distributed as dist
 import torchmetrics.functional as tmf
 from lightning.pytorch.strategies.ddp import DDPStrategy
 from lightning.pytorch.utilities import move_data_to_device
@@ -465,6 +466,8 @@ class TrainingPlan(pl.LightningModule):
         # loss kwargs here contains `n_obs` equal to the n_training_obs,
         # so when relevant, the actual loss value is rescaled to the number
         # of training examples
+        if "kl_weight" in self.loss_kwargs:
+            self.loss_kwargs.update({"kl_weight": self.kl_weight})
         _, _, scvi_loss = self.forward(batch, loss_kwargs=self.loss_kwargs)
         self.log(
             "validation_loss",
@@ -544,11 +547,29 @@ class TrainingPlan(pl.LightningModule):
 class _AdversarialSkipWarningMixin:
     """Mixin for skip-warning counters and warning emission in adversarial plans."""
 
-    def _init_skip_warning_state(self) -> None:
+    def _init_skip_warning_state(self, *, max_consecutive_skips: int | None = None) -> None:
         self._main_skip_streak = 0
         self._main_skip_total = 0
         self._cls_skip_streak = 0
         self._cls_skip_total = 0
+        self._max_consecutive_skips = max_consecutive_skips
+
+    def _sync_skip_decision(self, local_skip: bool, device: torch.device) -> bool:
+        """Return True if ANY DDP rank wants to skip this step."""
+        if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+            return local_skip
+        flag = torch.tensor([1.0 if local_skip else 0.0], device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        return flag.item() > 0.0
+
+    def _check_max_consecutive_skips(self, streak: int, *, kind: str) -> None:
+        max_skips = getattr(self, "_max_consecutive_skips", None)
+        if max_skips is None or streak <= max_skips:
+            return
+        raise RuntimeError(
+            f"{type(self).__name__}: exceeded max_consecutive_skips={max_skips} "
+            f"for {kind} minibatch skips (streak={streak})."
+        )
 
     def _should_emit_skip_warning(self) -> bool:
         trainer = getattr(self, "trainer", None)
@@ -571,6 +592,7 @@ class _AdversarialSkipWarningMixin:
     def _record_main_skip(self, batch_idx: int, reason: str) -> None:
         self._main_skip_streak += 1
         self._main_skip_total += 1
+        self._check_max_consecutive_skips(self._main_skip_streak, kind="main")
         self._warn_skipped_minibatch(
             batch_idx, reason, self._main_skip_streak, self._main_skip_total
         )
@@ -578,6 +600,7 @@ class _AdversarialSkipWarningMixin:
     def _record_cls_skip(self, batch_idx: int, reason: str) -> None:
         self._cls_skip_streak += 1
         self._cls_skip_total += 1
+        self._check_max_consecutive_skips(self._cls_skip_streak, kind="classifier")
         self._warn_skipped_minibatch(
             batch_idx, reason, self._cls_skip_streak, self._cls_skip_total
         )
@@ -630,6 +653,9 @@ class AdversarialTrainingPlan(_AdversarialSkipWarningMixin, TrainingPlan):
         kl warmup.
     max_grad_norm
         Maximum gradient norm for clipping before optimizer steps.
+    max_consecutive_skips
+        If set, raise when consecutive main or classifier minibatch skips exceed this
+        count. ``None`` disables the guard.
     compile
         Whether to compile the model for faster training
     **loss_kwargs
@@ -658,6 +684,7 @@ class AdversarialTrainingPlan(_AdversarialSkipWarningMixin, TrainingPlan):
         adversarial_classifier: bool | Classifier = False,
         scale_adversarial_loss: float | Literal["auto"] = "auto",
         max_grad_norm: float = 10.0,
+        max_consecutive_skips: int | None = None,
         compile: bool = False,
         compile_kwargs: dict | None = None,
         **loss_kwargs,
@@ -702,7 +729,7 @@ class AdversarialTrainingPlan(_AdversarialSkipWarningMixin, TrainingPlan):
         self.scale_adversarial_loss = scale_adversarial_loss
         self.max_grad_norm = max_grad_norm
         self.automatic_optimization = False
-        self._init_skip_warning_state()
+        self._init_skip_warning_state(max_consecutive_skips=max_consecutive_skips)
 
     @staticmethod
     def _zero_optimizer_grads(*optimizers):
@@ -779,7 +806,8 @@ class AdversarialTrainingPlan(_AdversarialSkipWarningMixin, TrainingPlan):
             fool_loss = self.loss_adversarial_classifier(z, batch_tensor, False)
             loss += fool_loss * kappa
 
-        if not torch.isfinite(loss).all():
+        main_bad = not torch.isfinite(loss).all()
+        if self._sync_skip_decision(main_bad, device):
             self._record_main_skip(batch_idx, "non-finite main loss")
             self._zero_optimizer_grads(opt1, opt2)
             return torch.zeros((), device=device)
@@ -805,7 +833,8 @@ class AdversarialTrainingPlan(_AdversarialSkipWarningMixin, TrainingPlan):
             cls_loss = self.loss_adversarial_classifier(z.detach(), batch_tensor, True)
             cls_loss = cls_loss * kappa
 
-            if not torch.isfinite(cls_loss).all():
+            cls_bad = not torch.isfinite(cls_loss).all()
+            if self._sync_skip_decision(cls_bad, device):
                 self._record_cls_skip(batch_idx, "non-finite classifier loss")
                 self._zero_optimizer_grads(opt2)
                 return orig_loss.detach()
@@ -1162,6 +1191,9 @@ class SemiSupervisedAdversarialTrainingPlan(
         kl warmup.
     max_grad_norm
         Maximum gradient norm for clipping before optimizer steps.
+    max_consecutive_skips
+        If set, raise when consecutive main or classifier minibatch skips exceed this
+        count. ``None`` disables the guard.
     **loss_kwargs
         Keyword args to pass to the loss method of the `module`.
         `kl_weight` should not be passed here and is handled automatically.
@@ -1191,6 +1223,7 @@ class SemiSupervisedAdversarialTrainingPlan(
         adversarial_classifier: bool | Classifier = False,
         scale_adversarial_loss: float | Literal["auto"] = "auto",
         max_grad_norm: float = 50.0,
+        max_consecutive_skips: int | None = None,
         **loss_kwargs,
     ):
         super().__init__(
@@ -1242,7 +1275,7 @@ class SemiSupervisedAdversarialTrainingPlan(
         self.scale_adversarial_loss = scale_adversarial_loss
         self.max_grad_norm = max_grad_norm
         self.automatic_optimization = False
-        self._init_skip_warning_state()
+        self._init_skip_warning_state(max_consecutive_skips=max_consecutive_skips)
 
     def _step_optimizer(
         self,
@@ -1329,7 +1362,8 @@ class SemiSupervisedAdversarialTrainingPlan(
                 prog_bar=True,
             )
 
-        if not torch.isfinite(loss).all():
+        main_bad = not torch.isfinite(loss).all()
+        if self._sync_skip_decision(main_bad, device):
             self._record_main_skip(batch_idx, "non-finite main loss")
             AdversarialTrainingPlan._zero_optimizer_grads(opt1, opt2)
             return torch.zeros((), device=device)
@@ -1355,7 +1389,8 @@ class SemiSupervisedAdversarialTrainingPlan(
             cls_loss = self.loss_adversarial_classifier(z.detach(), batch_tensor, True)
             cls_loss = cls_loss * kappa
 
-            if not torch.isfinite(cls_loss).all():
+            cls_bad = not torch.isfinite(cls_loss).all()
+            if self._sync_skip_decision(cls_bad, device):
                 self._record_cls_skip(batch_idx, "non-finite classifier loss")
                 AdversarialTrainingPlan._zero_optimizer_grads(opt2)
                 return orig_loss.detach()
